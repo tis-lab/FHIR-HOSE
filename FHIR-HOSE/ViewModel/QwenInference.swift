@@ -144,8 +144,8 @@ class QwenInference: ObservableObject, @unchecked Sendable {
             var nCur = batch.n_tokens
             var responseBytes = Data()
 
-            let maxGenTokens = max(8192 - nTokens, 256)
-            logger.info("Generation budget: \(maxGenTokens) tokens (8192 - \(nTokens) prompt)")
+            let maxGenTokens = min(max(8192 - nTokens, 256), 768)
+            logger.info("Generation budget: \(maxGenTokens) tokens (capped at 768, thinking pre-filled)")
             var generatedCount = 0
             for _ in 0..<maxGenTokens {
                 if self.shouldStop { break }
@@ -182,7 +182,8 @@ class QwenInference: ObservableObject, @unchecked Sendable {
                     }
 
                     if let decoded = String(data: responseBytes, encoding: .utf8) {
-                        let display = self.cleanResponse(decoded)
+                        let cleaned = self.cleanResponse(decoded)
+                        let display = cleaned.isEmpty ? "Thinking..." : cleaned
                         DispatchQueue.main.async {
                             self.currentResponse = display
                         }
@@ -232,15 +233,18 @@ class QwenInference: ObservableObject, @unchecked Sendable {
         for msg in messages {
             prompt += "<|im_start|>\(msg.role)\n\(msg.content)<|im_end|>\n"
         }
-        prompt += "<|im_start|>assistant\n"
+        prompt += "<|im_start|>assistant\n<think>\n</think>\n"
         return prompt
     }
 
     private func cleanResponse(_ text: String) -> String {
         var result = text
-        result = result.replacingOccurrences(of: "<think>", with: "")
-        result = result.replacingOccurrences(of: "</think>", with: "")
-        result = result.replacingOccurrences(of: "Thinking Process:", with: "")
+        if let range = result.range(of: "<think>[\\s\\S]*?</think>", options: .regularExpression) {
+            result.removeSubrange(range)
+        }
+        if let thinkStart = result.range(of: "<think>") {
+            result.removeSubrange(thinkStart.lowerBound...)
+        }
         return result.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 

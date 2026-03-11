@@ -10,6 +10,35 @@ import Foundation
 
 private let fileLogger = FileLogger.shared
 
+extension HKBloodType {
+    var displayString: String {
+        switch self {
+        case .notSet:    return "Not Set"
+        case .aPositive: return "A+"
+        case .aNegative: return "A-"
+        case .bPositive: return "B+"
+        case .bNegative: return "B-"
+        case .abPositive: return "AB+"
+        case .abNegative: return "AB-"
+        case .oPositive:  return "O+"
+        case .oNegative:  return "O-"
+        @unknown default: return "Unknown"
+        }
+    }
+}
+
+extension HKBiologicalSex {
+    var displayString: String {
+        switch self {
+        case .notSet:  return "Not Set"
+        case .female:  return "Female"
+        case .male:    return "Male"
+        case .other:   return "Other"
+        @unknown default: return "Unknown"
+        }
+    }
+}
+
 class HealthKitManager: ObservableObject {
     let healthStore = HKHealthStore()
     
@@ -168,7 +197,7 @@ class HealthKitManager: ObservableObject {
             let biologicalSex = try healthStore.biologicalSex()
             let sexData: [String: Any] = [
                 "type": "biologicalSex",
-                "value": biologicalSex.biologicalSex.rawValue,
+                "value": biologicalSex.biologicalSex.displayString,
                 "displayName": "Biological Sex"
             ]
             records.append(HealthRecord(healthKitType: "BiologicalSex", data: sexData))
@@ -177,7 +206,7 @@ class HealthKitManager: ObservableObject {
             let bloodType = try healthStore.bloodType()
             let bloodData: [String: Any] = [
                 "type": "bloodType",
-                "value": bloodType.bloodType.rawValue,
+                "value": bloodType.bloodType.displayString,
                 "displayName": "Blood Type"
             ]
             records.append(HealthRecord(healthKitType: "BloodType", data: bloodData))

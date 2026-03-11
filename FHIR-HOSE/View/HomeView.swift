@@ -87,15 +87,17 @@ struct HomeView: View {
                 }
                 .buttonStyle(PlainButtonStyle())
 
-                NavigationLink(destination: QwenChatView(recordStore: recordStore)) {
-                    HealthAppCard(
-                        title: "Qwen Records Chat",
-                        subtitle: "On-device AI with your records",
-                        systemImage: "brain",
-                        color: .orange
-                    )
+                if #available(iOS 26, macOS 26, visionOS 26, *) {
+                    NavigationLink(destination: OnDeviceChatView(recordStore: recordStore)) {
+                        HealthAppCard(
+                            title: "On-Device AI Chat",
+                            subtitle: "Apple Intelligence with your records",
+                            systemImage: "apple.intelligence",
+                            color: .purple
+                        )
+                    }
+                    .buttonStyle(PlainButtonStyle())
                 }
-                .buttonStyle(PlainButtonStyle())
             }
             .padding()
         }
