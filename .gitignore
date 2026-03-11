@@ -15,3 +15,7 @@ logs/
 *secrets*
 *apikey*
 *.env
+
+# Model
+*.gguf
+

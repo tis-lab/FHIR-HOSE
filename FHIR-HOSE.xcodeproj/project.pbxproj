@@ -6,6 +6,10 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		003F42F72F60CB50002B4999 /* LlamaSwift in Frameworks */ = {isa = PBXBuildFile; productRef = 003F42F62F60CB50002B4999 /* LlamaSwift */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXContainerItemProxy section */
 		41195D142CFFA9A000A188A9 /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
@@ -68,6 +72,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				003F42F72F60CB50002B4999 /* LlamaSwift in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -128,6 +133,7 @@
 			);
 			name = "FHIR-HOSE";
 			packageProductDependencies = (
+				003F42F62F60CB50002B4999 /* LlamaSwift */,
 			);
 			productName = "FHIR-HOSE";
 			productReference = 41195D022CFFA99F00A188A9 /* FHIR-HOSE.app */;
@@ -211,6 +217,9 @@
 			);
 			mainGroup = 41195CF92CFFA99F00A188A9;
 			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				003F42F52F60CB50002B4999 /* XCRemoteSwiftPackageReference "llama" */,
+			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 41195D032CFFA99F00A188A9 /* Products */;
 			projectDirPath = "";
@@ -623,6 +632,25 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		003F42F52F60CB50002B4999 /* XCRemoteSwiftPackageReference "llama" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/mattt/llama.swift";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 2.8261.0;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		003F42F62F60CB50002B4999 /* LlamaSwift */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 003F42F52F60CB50002B4999 /* XCRemoteSwiftPackageReference "llama" */;
+			productName = LlamaSwift;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = 41195CFA2CFFA99F00A188A9 /* Project object */;
 }
