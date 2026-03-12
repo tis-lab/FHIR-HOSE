@@ -178,6 +178,19 @@ struct KTCDemoView: View {
             .background(Color(.systemGray6))
             .cornerRadius(12)
 
+            VStack(spacing: 6) {
+                Text("Detection Method")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                Picker("Detection Method", selection: $vm.backend) {
+                    ForEach(FormAutofillBackend.allCases) { backend in
+                        Text(backend.displayName).tag(backend)
+                    }
+                }
+                .pickerStyle(.segmented)
+            }
+            .padding(.horizontal)
+
             VStack(spacing: 12) {
                 if VNDocumentCameraViewController.isSupported {
                     Button {

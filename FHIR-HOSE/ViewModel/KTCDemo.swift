@@ -5,11 +5,45 @@
 //  Created by Claude Code on 1/27/26.
 //
 
+import CoreML
 import Foundation
 import NaturalLanguage
 import OSLog
 import UIKit
 import Vision
+
+// MARK: - Form Autofill Backend Selection
+
+enum FormAutofillBackend: String, CaseIterable, Identifiable {
+    case visionOCR = "visionOCR"
+    case layoutlmv3 = "layoutlmv3"
+    case udop = "udop"
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .visionOCR: return "Vision OCR"
+        case .layoutlmv3: return "LayoutLMv3"
+        case .udop: return "UDOP"
+        }
+    }
+
+    private static let userDefaultsKey = "formAutofillBackend"
+
+    static var persisted: FormAutofillBackend {
+        get {
+            guard let raw = UserDefaults.standard.string(forKey: userDefaultsKey),
+                  let value = FormAutofillBackend(rawValue: raw) else {
+                return .visionOCR
+            }
+            return value
+        }
+        set {
+            UserDefaults.standard.set(newValue.rawValue, forKey: userDefaultsKey)
+        }
+    }
+}
 
 // MARK: - Data Structures
 
@@ -78,6 +112,12 @@ final class KTCDemo: ObservableObject {
     }
 
     @Published var phase: Phase = .landing
+    @Published var backend: FormAutofillBackend = FormAutofillBackend.persisted {
+        didSet {
+            FormAutofillBackend.persisted = self.backend
+            self.logger.info("Form autofill backend changed to: \(self.backend.displayName)")
+        }
+    }
     @Published var pages: [UIImage] = []
     @Published var recognizedLines: [KTCRecognizedLine] = []
     @Published var fields: [KTCField] = []
@@ -518,26 +558,33 @@ final class KTCDemo: ObservableObject {
             phase = .error("Could not read the scanned image.")
             return
         }
-        logger.info("Starting OCR on first page (\(cgImage.width)x\(cgImage.height))")
 
+        logger.info("Pipeline starting — backend: \(self.backend.displayName), image: \(cgImage.width)x\(cgImage.height)")
+
+        switch backend {
+        case .visionOCR:
+            runVisionOCRPipeline(cgImage: cgImage)
+        case .layoutlmv3:
+            runLayoutLMv3Pipeline(cgImage: cgImage)
+        case .udop:
+            runUDOPPipeline(cgImage: cgImage)
+        }
+    }
+
+    // MARK: - Vision OCR Pipeline (old way)
+
+    private func runVisionOCRPipeline(cgImage: CGImage) {
         Task.detached(priority: .userInitiated) { [weak self] in
             guard let self else { return }
             do {
-                // 1. OCR
                 let lines = try await Self.performOCR(on: cgImage, pageIndex: 0)
-                // 2. Extract label candidates
                 var detectedFields = Self.extractLabelCandidates(from: lines)
-                // 3. Detect checkboxes, group them, and classify field types
                 let checkboxes = Self.detectCheckboxes(from: lines)
                 var checkboxGroups = Self.groupCheckboxes(checkboxes, allLines: lines)
                 Self.classifyFieldTypes(&detectedFields, checkboxes: checkboxes, allLines: lines)
-                // 4. Spatial analysis: find values near labels
                 Self.associateValuesWithLabels(&detectedFields, allLines: lines)
-                // 5. Load + flatten patient JSON
                 let data = KTCPatientDataLoader.loadAndFlatten()
-                // 6. Fuzzy-match labels → keypaths and fill values
                 KTCPatientDataLoader.applyMappings(to: &detectedFields, using: data)
-                // 7. Auto-check checkboxes based on patient data
                 Self.autoCheckCheckboxGroups(&checkboxGroups, using: data)
 
                 await MainActor.run {
@@ -549,19 +596,411 @@ final class KTCDemo: ObservableObject {
                     let checkboxFields = detectedFields.filter { $0.fieldType == .checkbox }.count
                     let groupCount = checkboxGroups.count
                     let autoChecked = checkboxGroups.filter { $0.selectedIndex != nil }.count
-                    self.logger.info("OCR complete: \(lines.count) lines, \(detectedFields.count) fields (\(withValues) detected, \(checkboxFields) checkboxes, \(groupCount) groups, \(autoChecked) auto-checked), \(data.count) keypaths")
-                    // Haptic feedback on completion
+                    self.logger.info("[VisionOCR] Complete: \(lines.count) lines, \(detectedFields.count) fields (\(withValues) detected, \(checkboxFields) checkboxes, \(groupCount) groups, \(autoChecked) auto-checked), \(data.count) keypaths")
                     UINotificationFeedbackGenerator().notificationOccurred(.success)
                     self.phase = .editing
                 }
             } catch {
                 await MainActor.run {
-                    self.logger.error("OCR failed: \(error.localizedDescription)")
+                    self.logger.error("[VisionOCR] Failed: \(error.localizedDescription)")
                     UINotificationFeedbackGenerator().notificationOccurred(.error)
                     self.phase = .error("OCR failed: \(error.localizedDescription)")
                 }
             }
         }
+    }
+
+    // MARK: - UDOP Pipeline (new way)
+
+    private struct UDOPWordBox {
+        let word: String
+        let boundingBox: CGRect
+    }
+
+    private func runUDOPPipeline(cgImage: CGImage) {
+        let udopLogger = Logger(subsystem: "com.fhirhose.app", category: "KTC.UDOP")
+        udopLogger.info("[UDOP] Starting pipeline for image \(cgImage.width)x\(cgImage.height)")
+        print("[UDOP] Starting pipeline for image \(cgImage.width)x\(cgImage.height)")
+
+        Task.detached(priority: .userInitiated) { [weak self] in
+            guard let self else { return }
+            let t0 = CFAbsoluteTimeGetCurrent()
+
+            do {
+                // 1 — Tokenizer
+                guard let spURL = Bundle.main.url(forResource: "spiece", withExtension: "model") else {
+                    throw NSError(domain: "UDOP", code: 1,
+                                  userInfo: [NSLocalizedDescriptionKey: "spiece.model not found in bundle"])
+                }
+                let tokenizer = try SentencePieceTokenizer(modelURL: spURL)
+                udopLogger.info("[UDOP] Tokenizer ready (\(tokenizer.vocabSize) pieces)")
+                print("[UDOP] Tokenizer ready (\(tokenizer.vocabSize) pieces)")
+
+                // 2 — Core ML models
+                let eCfg = MLModelConfiguration()
+                eCfg.computeUnits = .all
+                let encoder = try UdopEncoder(configuration: eCfg)
+
+                let dCfg = MLModelConfiguration()
+                dCfg.computeUnits = .all
+                let decoder = try UdopDecoder(configuration: dCfg)
+                let modelLoadTime = String(format: "%.1f", CFAbsoluteTimeGetCurrent() - t0)
+                udopLogger.info("[UDOP] Models loaded in \(modelLoadTime)s")
+                print("[UDOP] Models loaded in \(modelLoadTime)s")
+
+                // 3 — Word-level OCR
+                let words = try await Self.udopWordOCR(cgImage)
+                let ocrSnippet = words.prefix(30).map(\.word).joined(separator: " ")
+                udopLogger.info("[UDOP] OCR found \(words.count) words: \(ocrSnippet)…")
+                print("[UDOP] OCR found \(words.count) words: \(ocrSnippet)…")
+
+                // 4 — Tokenize + align bounding boxes (max 128 token slots)
+                let maxSeq = 128
+                // Match HuggingFace working example format: "Question answering. What is..."
+                let taskPrefix = "Question answering. What is the date on the form?"
+                print("[UDOP] Task prefix: \(taskPrefix)")
+                let (inputIds, bboxes, mask) = Self.udopTokenize(
+                    words: words, tokenizer: tokenizer, maxLength: maxSeq,
+                    taskPrefix: taskPrefix
+                )
+                let realTokenCount = mask.filter { $0 == 1 }.count
+                udopLogger.info("[UDOP] \(realTokenCount)/\(maxSeq) token slots used")
+                print("[UDOP] \(realTokenCount)/\(maxSeq) token slots used")
+
+                let previewIds = inputIds.prefix(min(20, realTokenCount))
+                let previewPieces = previewIds.map { tokenizer.pieceName(for: $0) }
+                print("[UDOP] First tokens: \(previewPieces.joined(separator: "|"))")
+                udopLogger.info("[UDOP] First tokens: \(previewPieces.joined(separator: "|"))")
+
+                // 5 — Image → pixel_values [1, 3, 512, 512]
+                let pixels = try Self.udopPreprocessImage(cgImage)
+                udopLogger.info("[UDOP] Image preprocessed to 512×512")
+
+                // 6 — Encoder
+                let t1 = CFAbsoluteTimeGetCurrent()
+                let (hiddenStates, encMask) = try Self.udopEncode(
+                    model: encoder.model,
+                    inputIds: inputIds, bboxes: bboxes,
+                    mask: mask, pixels: pixels
+                )
+                let encTime = String(format: "%.2f", CFAbsoluteTimeGetCurrent() - t1)
+                udopLogger.info("[UDOP] Encoder done in \(encTime)s  hidden=\(hiddenStates.shape)")
+                print("[UDOP] Encoder done in \(encTime)s  hidden=\(hiddenStates.shape)")
+
+                // 7 — Autoregressive decoder (greedy, up to 64 tokens)
+                let t2 = CFAbsoluteTimeGetCurrent()
+                let outputIds = try Self.udopDecode(
+                    model: decoder.model,
+                    hiddenStates: hiddenStates,
+                    encoderMask: encMask,
+                    tokenizer: tokenizer,
+                    maxTokens: 64,
+                    logger: udopLogger
+                )
+                let outputText = tokenizer.decode(outputIds)
+                let decTime = String(format: "%.2f", CFAbsoluteTimeGetCurrent() - t2)
+                udopLogger.info("[UDOP] Decoder done in \(decTime)s")
+                udopLogger.info("[UDOP] Output text (\(outputIds.count) tokens): \(outputText)")
+                udopLogger.info("[UDOP] Output IDs: \(outputIds.map(String.init).joined(separator: ","))")
+                print("[UDOP] Decoder done in \(decTime)s")
+                print("[UDOP] Output text (\(outputIds.count) tokens): \(outputText)")
+                print("[UDOP] Output IDs: \(outputIds.map(String.init).joined(separator: ","))")
+
+                let total = String(format: "%.2f", CFAbsoluteTimeGetCurrent() - t0)
+                udopLogger.info("[UDOP] Full pipeline completed in \(total)s")
+                print("[UDOP] Full pipeline completed in \(total)s")
+
+                // 8 — Transition to editing
+                let data = KTCPatientDataLoader.loadAndFlatten()
+
+                await MainActor.run {
+                    self.recognizedLines = []
+                    self.fields = []
+                    self.checkboxGroups = []
+                    self.patientData = data
+                    udopLogger.info("[UDOP] → editing phase  keypaths=\(data.count)  decoder_output=\"\(outputText)\"")
+                    UINotificationFeedbackGenerator().notificationOccurred(.success)
+                    self.phase = .editing
+                }
+            } catch {
+                let elapsed = CFAbsoluteTimeGetCurrent() - t0
+                let errTime = String(format: "%.2f", elapsed)
+                udopLogger.error("[UDOP] Failed after \(errTime)s: \(error.localizedDescription)")
+                print("[UDOP] FAILED after \(errTime)s: \(error.localizedDescription)")
+
+                await MainActor.run {
+                    UINotificationFeedbackGenerator().notificationOccurred(.error)
+                    self.phase = .error("UDOP failed: \(error.localizedDescription)")
+                }
+            }
+        }
+    }
+
+    // MARK: - UDOP Helpers
+
+    /// Run Vision OCR and return word-level text + bounding boxes.
+    private nonisolated static func udopWordOCR(_ cgImage: CGImage) async throws -> [UDOPWordBox] {
+        try await withCheckedThrowingContinuation { cont in
+            let req = VNRecognizeTextRequest { req, err in
+                if let err { cont.resume(throwing: err); return }
+                guard let obs = req.results as? [VNRecognizedTextObservation] else {
+                    cont.resume(returning: []); return
+                }
+                var boxes: [UDOPWordBox] = []
+                for o in obs {
+                    guard let c = o.topCandidates(1).first else { continue }
+                    let text = c.string
+                    let words = text.components(separatedBy: .whitespaces).filter { !$0.isEmpty }
+                    var search = text.startIndex
+                    for w in words {
+                        guard let range = text.range(of: w, range: search..<text.endIndex) else { continue }
+                        search = range.upperBound
+                        if let rect = try? c.boundingBox(for: range) {
+                            boxes.append(UDOPWordBox(word: w, boundingBox: rect.boundingBox))
+                        } else {
+                            boxes.append(UDOPWordBox(word: w, boundingBox: o.boundingBox))
+                        }
+                    }
+                }
+                cont.resume(returning: boxes)
+            }
+            req.recognitionLevel = .accurate
+            req.usesLanguageCorrection = true
+            req.recognitionLanguages = ["en-US"]
+            if #available(iOS 16.0, *) {
+                req.revision = VNRecognizeTextRequestRevision3
+            }
+            let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+            do { try handler.perform([req]) }
+            catch { cont.resume(throwing: error) }
+        }
+    }
+
+    /// Tokenize OCR words, align each subword token with its word-level bbox,
+    /// and pad/truncate to `maxLength`. Returns (input_ids, bboxes, attention_mask).
+    /// If `taskPrefix` is provided, its tokens are prepended with [0,0,0,0] bboxes.
+    private nonisolated static func udopTokenize(
+        words: [UDOPWordBox],
+        tokenizer: SentencePieceTokenizer,
+        maxLength: Int,
+        taskPrefix: String? = nil
+    ) -> (ids: [Int32], bboxes: [[Int32]], mask: [Int32]) {
+        var ids: [Int32] = []
+        var bboxes: [[Int32]] = []
+
+        if let prefix = taskPrefix {
+            let prefixTokens = tokenizer.encode(prefix)
+            for t in prefixTokens {
+                ids.append(t)
+                bboxes.append([0, 0, 0, 0])
+                if ids.count >= maxLength - 1 { break }
+            }
+        }
+
+        for wb in words {
+            let toks = tokenizer.encode(wb.word)
+            let b = wb.boundingBox
+            // Vision (0-1, bottom-left origin) → UDOP (0-1000, top-left origin)
+            let box: [Int32] = [
+                Int32(max(0, min(1000, Int(b.minX * 1000)))),
+                Int32(max(0, min(1000, Int((1 - b.maxY) * 1000)))),
+                Int32(max(0, min(1000, Int(b.maxX * 1000)))),
+                Int32(max(0, min(1000, Int((1 - b.minY) * 1000))))
+            ]
+            for t in toks {
+                ids.append(t)
+                bboxes.append(box)
+                if ids.count >= maxLength - 1 { break }
+            }
+            if ids.count >= maxLength - 1 { break }
+        }
+
+        ids.append(tokenizer.eosId)
+        bboxes.append([0, 0, 0, 0])
+
+        let realCount = ids.count
+        while ids.count < maxLength {
+            ids.append(tokenizer.padId)
+            bboxes.append([0, 0, 0, 0])
+        }
+
+        let mask = (0..<maxLength).map { Int32($0 < realCount ? 1 : 0) }
+        return (ids, bboxes, mask)
+    }
+
+    /// Resize a CGImage to 512×512 and produce a normalised `pixel_values`
+    /// MLMultiArray with shape [1, 3, 512, 512] in float16 (ImageNet stats).
+    private nonisolated static func udopPreprocessImage(_ cgImage: CGImage) throws -> MLMultiArray {
+        let w = 512, h = 512
+        guard let ctx = CGContext(
+            data: nil, width: w, height: h,
+            bitsPerComponent: 8, bytesPerRow: w * 4,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else {
+            throw NSError(domain: "UDOP", code: 2,
+                          userInfo: [NSLocalizedDescriptionKey: "Cannot create CGContext"])
+        }
+        ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: w, height: h))
+        guard let data = ctx.data else {
+            throw NSError(domain: "UDOP", code: 3,
+                          userInfo: [NSLocalizedDescriptionKey: "No pixel data from CGContext"])
+        }
+
+        let px = data.bindMemory(to: UInt8.self, capacity: w * h * 4)
+        let arr = try MLMultiArray(
+            shape: [1, 3, NSNumber(value: h), NSNumber(value: w)],
+            dataType: .float16
+        )
+        let ptr = UnsafeMutablePointer<Float16>(OpaquePointer(arr.dataPointer))
+        let chStride = h * w
+        let mean: [Float] = [0.485, 0.456, 0.406]
+        let std:  [Float] = [0.229, 0.224, 0.225]
+
+        for row in 0..<h {
+            for col in 0..<w {
+                let i = (row * w + col) * 4
+                let r = Float(px[i])     / 255.0
+                let g = Float(px[i + 1]) / 255.0
+                let b = Float(px[i + 2]) / 255.0
+                ptr[0 * chStride + row * w + col] = Float16((r - mean[0]) / std[0])
+                ptr[1 * chStride + row * w + col] = Float16((g - mean[1]) / std[1])
+                ptr[2 * chStride + row * w + col] = Float16((b - mean[2]) / std[2])
+            }
+        }
+        return arr
+    }
+
+    /// Build MLMultiArrays for encoder inputs and run a single forward pass.
+    /// Returns (encoder_hidden_states, encoder_attention_mask).
+    private nonisolated static func udopEncode(
+        model: MLModel,
+        inputIds: [Int32],
+        bboxes: [[Int32]],
+        mask: [Int32],
+        pixels: MLMultiArray
+    ) throws -> (hiddenStates: MLMultiArray, attentionMask: MLMultiArray) {
+        let seq = inputIds.count
+
+        let idsArr  = try MLMultiArray(shape: [1, NSNumber(value: seq)], dataType: .int32)
+        let maskArr = try MLMultiArray(shape: [1, NSNumber(value: seq)], dataType: .int32)
+        let bboxArr = try MLMultiArray(shape: [1, NSNumber(value: seq), 4], dataType: .int32)
+
+        let idsPtr  = UnsafeMutablePointer<Int32>(OpaquePointer(idsArr.dataPointer))
+        let maskPtr = UnsafeMutablePointer<Int32>(OpaquePointer(maskArr.dataPointer))
+        let bboxPtr = UnsafeMutablePointer<Int32>(OpaquePointer(bboxArr.dataPointer))
+
+        for i in 0..<seq {
+            idsPtr[i]  = inputIds[i]
+            maskPtr[i] = mask[i]
+            for j in 0..<4 { bboxPtr[i * 4 + j] = bboxes[i][j] }
+        }
+
+        let provider = try MLDictionaryFeatureProvider(dictionary: [
+            "input_ids":      MLFeatureValue(multiArray: idsArr),
+            "bbox":           MLFeatureValue(multiArray: bboxArr),
+            "attention_mask": MLFeatureValue(multiArray: maskArr),
+            "pixel_values":   MLFeatureValue(multiArray: pixels),
+        ])
+
+        let out = try model.prediction(from: provider)
+        let hs = out.featureValue(for: "encoder_hidden_states")!.multiArrayValue!
+        let em = out.featureValue(for: "encoder_attention_mask")!.multiArrayValue!
+        return (hs, em)
+    }
+
+    /// Greedy autoregressive decoding with full-sequence [1,64] decoder.
+    /// Maintains persistent input arrays and fills left-to-right, reading
+    /// logits at the current step position each iteration.
+    private nonisolated static func udopDecode(
+        model: MLModel,
+        hiddenStates: MLMultiArray,
+        encoderMask: MLMultiArray,
+        tokenizer: SentencePieceTokenizer,
+        maxTokens: Int,
+        logger: Logger
+    ) throws -> [Int32] {
+        let maskInt: MLMultiArray
+        if encoderMask.dataType != .int32 {
+            let n = encoderMask.count
+            maskInt = try MLMultiArray(shape: encoderMask.shape, dataType: .int32)
+            let dst = UnsafeMutablePointer<Int32>(OpaquePointer(maskInt.dataPointer))
+            if encoderMask.dataType == .float16 {
+                let src = UnsafePointer<Float16>(OpaquePointer(encoderMask.dataPointer))
+                for i in 0..<n { dst[i] = Int32(src[i]) }
+            } else {
+                for i in 0..<n { dst[i] = encoderMask[i].int32Value }
+            }
+        } else {
+            maskInt = encoderMask
+        }
+
+        let seqLen = 64
+        let decIds = try MLMultiArray(shape: [1, NSNumber(value: seqLen)], dataType: .int32)
+        let decMask = try MLMultiArray(shape: [1, NSNumber(value: seqLen)], dataType: .int32)
+        let idPtr = UnsafeMutablePointer<Int32>(OpaquePointer(decIds.dataPointer))
+        let maskPtr = UnsafeMutablePointer<Int32>(OpaquePointer(decMask.dataPointer))
+
+        for i in 0..<seqLen {
+            idPtr[i] = tokenizer.padId
+            maskPtr[i] = 0
+        }
+        idPtr[0] = tokenizer.padId
+        maskPtr[0] = 1
+
+        var outputTokens: [Int32] = []
+
+        for step in 0..<min(maxTokens, seqLen - 1) {
+            let prov = try MLDictionaryFeatureProvider(dictionary: [
+                "decoder_input_ids":     MLFeatureValue(multiArray: decIds),
+                "decoder_attention_mask": MLFeatureValue(multiArray: decMask),
+                "encoder_hidden_states": MLFeatureValue(multiArray: hiddenStates),
+                "encoder_attention_mask": MLFeatureValue(multiArray: maskInt),
+            ])
+
+            let result = try model.prediction(from: prov)
+            let logits = result.featureValue(for: "logits")!.multiArrayValue!
+            let vocab = logits.shape.last!.intValue
+            let strides = logits.strides.map { $0.intValue }
+            let posStride = strides[1]
+            let vocStride = strides[2]
+
+            if step == 0 {
+                logger.info("[UDOP] logits shape=\(logits.shape) strides=\(strides) dtype=\(logits.dataType.rawValue)")
+                print("[UDOP] logits shape=\(logits.shape) strides=\(strides) dtype=\(logits.dataType.rawValue)")
+            }
+
+            let baseOffset = step * posStride
+            var bestVal: Float = -.infinity
+            var bestId: Int32 = 0
+
+            if logits.dataType == .float16 {
+                let lp = UnsafePointer<Float16>(OpaquePointer(logits.dataPointer))
+                for v in 0..<vocab {
+                    let f = Float(lp[baseOffset + v * vocStride])
+                    if f > bestVal { bestVal = f; bestId = Int32(v) }
+                }
+            } else {
+                let lp = UnsafePointer<Float>(OpaquePointer(logits.dataPointer))
+                for v in 0..<vocab {
+                    let val = lp[baseOffset + v * vocStride]
+                    if val > bestVal { bestVal = val; bestId = Int32(v) }
+                }
+            }
+
+            let name = tokenizer.pieceName(for: bestId)
+            let logitStr = String(format: "%.2f", bestVal)
+            logger.info("[UDOP] step \(step): id=\(bestId) '\(name)' logit=\(logitStr)")
+            print("[UDOP] step \(step): id=\(bestId) '\(name)' logit=\(logitStr)")
+
+            if bestId == tokenizer.eosId { break }
+
+            outputTokens.append(bestId)
+            idPtr[step + 1] = bestId
+            maskPtr[step + 1] = 1
+        }
+
+        return outputTokens
     }
 
     /// Run VNRecognizeTextRequest and return recognized lines.

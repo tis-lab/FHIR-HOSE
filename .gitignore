@@ -18,4 +18,5 @@ logs/
 
 # Model
 *.gguf
-
+*.mlpackage
+*.model
