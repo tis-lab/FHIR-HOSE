@@ -34,20 +34,27 @@ final class LayoutLMv3Tokenizer {
     }
 
     /// Encode a list of words (e.g. from OCR) to token IDs and per-token bboxes.
-    /// Returns (inputIds, bboxes) both of length maxLength; bboxes are [x0,y0,x1,y1] in 0-1000.
+    /// Returns (inputIds, bboxes, tokenToWordIndex). inputIds and bboxes have length maxLength.
+    /// tokenToWordIndex[contentTokenIndex] = word index (0..<words.count) for that token; length = number of content tokens (between CLS and SEP).
     /// Word boxes should be in 0-1000, top-left origin.
+    /// Unknown words are split into characters (RoBERTa vocab has many single-char entries) so the model gets a better signal than all UNK.
     func encode(
         words: [String],
         boxes: [[Int32]],
         maxLength: Int
-    ) -> (inputIds: [Int32], bboxes: [[Int32]]) {
+    ) -> (inputIds: [Int32], bboxes: [[Int32]], tokenToWordIndex: [Int]) {
         var inputIds: [Int32] = [clsId]
         var bboxes: [[Int32]] = [[0, 0, 0, 0]]
+        var tokenToWordIndex: [Int] = []
 
-        for (word, box) in zip(words, boxes) {
-            let tid = tokenId(for: word)
-            inputIds.append(tid)
-            bboxes.append(box)
+        for (wordIndex, (word, box)) in zip(words, boxes).enumerated() {
+            let tids = tokenIds(for: word)
+            for tid in tids {
+                inputIds.append(tid)
+                bboxes.append(box)
+                tokenToWordIndex.append(wordIndex)
+                if inputIds.count >= maxLength - 1 { break }
+            }
             if inputIds.count >= maxLength - 1 { break }
         }
         inputIds.append(sepId)
@@ -57,14 +64,25 @@ final class LayoutLMv3Tokenizer {
             inputIds.append(padId)
             bboxes.append([0, 0, 0, 0])
         }
-        return (inputIds, bboxes)
+        return (inputIds, bboxes, tokenToWordIndex)
     }
 
-    private func tokenId(for word: String) -> Int32 {
+    /// One or more token IDs for a word: whole-word lookup, then space-prefixed, then Ġ-prefixed, then character-level fallback.
+    private func tokenIds(for word: String) -> [Int32] {
         let w = word.trimmingCharacters(in: .whitespaces)
-        if let id = vocab[w] { return Int32(id) }
-        if let id = vocab[" " + w] { return Int32(id) }
-        return unkId
+        if w.isEmpty { return [padId] }
+        if let id = vocab[w] { return [Int32(id)] }
+        if let id = vocab[" " + w] { return [Int32(id)] }
+        if let id = vocab["\u{0120}" + w] { return [Int32(id)] }
+        // Character-level fallback: RoBERTa vocab has many single-char entries; avoids feeding all UNK
+        var ids: [Int32] = []
+        for char in w {
+            let s = String(char)
+            if let id = vocab[s] { ids.append(Int32(id)) }
+            else if let id = vocab["\u{0120}" + s] { ids.append(Int32(id)) }
+            else { ids.append(unkId) }
+        }
+        return ids.isEmpty ? [unkId] : ids
     }
 
     var padTokenId: Int32 { padId }

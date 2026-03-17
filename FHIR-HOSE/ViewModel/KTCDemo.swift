@@ -610,6 +610,279 @@ final class KTCDemo: ObservableObject {
         }
     }
 
+    // MARK: - LayoutLMv3 Pipeline (token classification for form understanding)
+
+    private struct LayoutLMv3WordBox {
+        let word: String
+        let boundingBox: CGRect
+    }
+
+    private func runLayoutLMv3Pipeline(cgImage: CGImage) {
+        let log = Logger(subsystem: "com.fhirhose.app", category: "KTC.LayoutLMv3")
+        log.info("[LayoutLMv3] Starting pipeline for image \(cgImage.width)x\(cgImage.height)")
+        print("[LayoutLMv3] Starting pipeline for image \(cgImage.width)x\(cgImage.height)")
+
+        Task.detached(priority: .userInitiated) { [weak self] in
+            guard let self else { return }
+            let t0 = CFAbsoluteTimeGetCurrent()
+            do {
+                // 1 — Tokenizer (vocab.json from bundle, e.g. from HuggingFace model)
+                guard let vocabURL = Bundle.main.url(forResource: "vocab", withExtension: "json", subdirectory: "LayoutLMv3")
+                    ?? Bundle.main.url(forResource: "vocab", withExtension: "json") else {
+                    throw NSError(domain: "LayoutLMv3", code: 1,
+                                  userInfo: [NSLocalizedDescriptionKey: "vocab.json not found. Add LayoutLMv3 vocab to bundle (e.g. from HuggingFace nnul/layoutlmv3-finetuned-funsd)."])
+                }
+                let tokenizer = try LayoutLMv3Tokenizer(vocabURL: vocabURL)
+                log.info("[LayoutLMv3] Tokenizer loaded")
+                print("[LayoutLMv3] Tokenizer loaded")
+
+                // 2 — Core ML model (LayoutLMv3ForTokenClassification exported to .mlpackage)
+                guard let modelURL = Bundle.main.url(forResource: "LayoutLMv3", withExtension: "mlpackage", subdirectory: nil)
+                    ?? Bundle.main.url(forResource: "LayoutLMv3", withExtension: "mlmodelc", subdirectory: nil) else {
+                    throw NSError(domain: "LayoutLMv3", code: 2,
+                                  userInfo: [NSLocalizedDescriptionKey: "LayoutLMv3.mlpackage not found. Export LayoutLMv3ForTokenClassification (FUNSD) to Core ML and add to app bundle."])
+                }
+                let config = MLModelConfiguration()
+                config.computeUnits = .all
+                let model = try MLModel(contentsOf: modelURL, configuration: config)
+                let loadTime = String(format: "%.1f", CFAbsoluteTimeGetCurrent() - t0)
+                log.info("[LayoutLMv3] Model loaded in \(loadTime)s")
+                print("[LayoutLMv3] Model loaded in \(loadTime)s")
+
+                // 3 — Word-level OCR (same as UDOP path)
+                let wordBoxes = try await Self.layoutlmv3WordOCR(cgImage)
+                let words = wordBoxes.map(\.word)
+                let boxes1000 = wordBoxes.map { wb in
+                    let b = wb.boundingBox
+                    return [
+                        Int32(max(0, min(1000, Int(b.minX * 1000)))),
+                        Int32(max(0, min(1000, Int((1 - b.maxY) * 1000)))),
+                        Int32(max(0, min(1000, Int(b.maxX * 1000)))),
+                        Int32(max(0, min(1000, Int((1 - b.minY) * 1000)))),
+                    ]
+                }
+                log.info("[LayoutLMv3] OCR found \(words.count) words")
+                print("[LayoutLMv3] OCR found \(words.count) words")
+
+                let maxLen = 512
+                let (inputIds, bboxes, tokenToWordIndex) = tokenizer.encode(words: words, boxes: boxes1000, maxLength: maxLen)
+                let realCount = inputIds.firstIndex(of: tokenizer.padTokenId) ?? inputIds.count
+                let attentionMask = (0..<maxLen).map { i in Int32(i < realCount ? 1 : 0) }
+
+                // 4 — Image 224×224 (LayoutLMv3 base)
+                let pixelValues = try Self.layoutlmv3PreprocessImage(cgImage)
+                log.info("[LayoutLMv3] Image preprocessed 224×224")
+                print("[LayoutLMv3] Image preprocessed 224×224")
+
+                // 5 — Run model
+                let (fieldsFromModel, linesFromModel) = try Self.layoutlmv3RunAndDecode(
+                    model: model,
+                    inputIds: inputIds,
+                    bboxes: bboxes,
+                    attentionMask: attentionMask,
+                    pixelValues: pixelValues,
+                    wordBoxes: wordBoxes,
+                    tokenToWordIndex: tokenToWordIndex,
+                    numLabels: 7
+                )
+                log.info("[LayoutLMv3] Decoded \(fieldsFromModel.count) fields, \(linesFromModel.count) lines")
+                print("[LayoutLMv3] Decoded \(fieldsFromModel.count) fields, \(linesFromModel.count) lines")
+
+                let data = KTCPatientDataLoader.loadAndFlatten()
+                var detectedFields = fieldsFromModel
+                KTCPatientDataLoader.applyMappings(to: &detectedFields, using: data)
+
+                await MainActor.run {
+                    self.recognizedLines = linesFromModel
+                    self.fields = detectedFields
+                    self.checkboxGroups = []
+                    self.patientData = data
+                    let total = String(format: "%.1f", CFAbsoluteTimeGetCurrent() - t0)
+                    self.logger.info("[LayoutLMv3] Complete in \(total)s: \(detectedFields.count) fields")
+                    print("[LayoutLMv3] Complete in \(total)s: \(detectedFields.count) fields")
+                    UINotificationFeedbackGenerator().notificationOccurred(.success)
+                    self.phase = .editing
+                }
+            } catch {
+                await MainActor.run {
+                    self.logger.error("[LayoutLMv3] Failed: \(error.localizedDescription)")
+                    print("[LayoutLMv3] Failed: \(error.localizedDescription)")
+                    UINotificationFeedbackGenerator().notificationOccurred(.error)
+                    self.phase = .error("LayoutLMv3 failed: \(error.localizedDescription)")
+                }
+            }
+        }
+    }
+
+    private static func layoutlmv3WordOCR(_ cgImage: CGImage) async throws -> [LayoutLMv3WordBox] {
+        let request = VNRecognizeTextRequest()
+        request.recognitionLevel = .accurate
+        request.usesLanguageCorrection = false
+        let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+        try handler.perform([request])
+        guard let obs = request.results else { return [] }
+        var boxes: [LayoutLMv3WordBox] = []
+        for obs in obs {
+            let topCands = obs.topCandidates(1)
+            guard let line = topCands.first?.string else { continue }
+            let words = line.split(separator: " ", omittingEmptySubsequences: false)
+                .map(String.init)
+            if words.isEmpty {
+                boxes.append(LayoutLMv3WordBox(word: line, boundingBox: obs.boundingBox))
+            } else {
+                for w in words where !w.isEmpty {
+                    boxes.append(LayoutLMv3WordBox(word: w, boundingBox: obs.boundingBox))
+                }
+            }
+        }
+        return boxes
+    }
+
+    private nonisolated static func layoutlmv3PreprocessImage(_ cgImage: CGImage) throws -> MLMultiArray {
+        let w = 224
+        let h = 224
+        guard let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+                                  space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else {
+            throw NSError(domain: "LayoutLMv3", code: 3, userInfo: [NSLocalizedDescriptionKey: "Cannot create CGContext"])
+        }
+        ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: w, height: h))
+        guard let data = ctx.data else {
+            throw NSError(domain: "LayoutLMv3", code: 4, userInfo: [NSLocalizedDescriptionKey: "No pixel data"])
+        }
+        let px = data.bindMemory(to: UInt8.self, capacity: w * h * 4)
+        let arr = try MLMultiArray(shape: [1, 3, NSNumber(value: h), NSNumber(value: w)], dataType: .float32)
+        let ptr = UnsafeMutablePointer<Float>(OpaquePointer(arr.dataPointer))
+        let mean: [Float] = [0.485, 0.456, 0.406]
+        let std: [Float] = [0.229, 0.224, 0.225]
+        let chStride = h * w
+        for row in 0..<h {
+            for col in 0..<w {
+                let i = (row * w + col) * 4
+                let r = Float(px[i]) / 255.0
+                let g = Float(px[i + 1]) / 255.0
+                let b = Float(px[i + 2]) / 255.0
+                ptr[0 * chStride + row * w + col] = (r - mean[0]) / std[0]
+                ptr[1 * chStride + row * w + col] = (g - mean[1]) / std[1]
+                ptr[2 * chStride + row * w + col] = (b - mean[2]) / std[2]
+            }
+        }
+        return arr
+    }
+
+    /// FUNSD-style labels: O, B-QUESTION, I-QUESTION, B-ANSWER, I-ANSWER, B-HEADER, I-HEADER
+    // Standard FUNSD order (HuggingFace: O, B-HEADER, I-HEADER, B-QUESTION, I-QUESTION, B-ANSWER, I-ANSWER). If your model uses a different id2label, reorder this array.
+    private static let layoutlmv3LabelNames = ["O", "B-HEADER", "I-HEADER", "B-QUESTION", "I-QUESTION", "B-ANSWER", "I-ANSWER"]
+
+    private nonisolated static func layoutlmv3RunAndDecode(
+        model: MLModel,
+        inputIds: [Int32],
+        bboxes: [[Int32]],
+        attentionMask: [Int32],
+        pixelValues: MLMultiArray,
+        wordBoxes: [LayoutLMv3WordBox],
+        tokenToWordIndex: [Int],
+        numLabels: Int
+    ) throws -> (fields: [KTCField], lines: [KTCRecognizedLine]) {
+        let seqLen = inputIds.count
+        let idsArr = try MLMultiArray(shape: [1, NSNumber(value: seqLen)], dataType: .int32)
+        let maskArr = try MLMultiArray(shape: [1, NSNumber(value: seqLen)], dataType: .int32)
+        let bboxArr = try MLMultiArray(shape: [1, NSNumber(value: seqLen), 4], dataType: .int32)
+        let idsPtr = UnsafeMutablePointer<Int32>(OpaquePointer(idsArr.dataPointer))
+        let maskPtr = UnsafeMutablePointer<Int32>(OpaquePointer(maskArr.dataPointer))
+        let bboxPtr = UnsafeMutablePointer<Int32>(OpaquePointer(bboxArr.dataPointer))
+        for i in 0..<seqLen {
+            idsPtr[i] = inputIds[i]
+            maskPtr[i] = attentionMask[i]
+            for j in 0..<4 { bboxPtr[i * 4 + j] = bboxes[i][j] }
+        }
+        let provider = try MLDictionaryFeatureProvider(dictionary: [
+            "input_ids": MLFeatureValue(multiArray: idsArr),
+            "attention_mask": MLFeatureValue(multiArray: maskArr),
+            "bbox": MLFeatureValue(multiArray: bboxArr),
+            "pixel_values": MLFeatureValue(multiArray: pixelValues),
+        ])
+        let result = try model.prediction(from: provider)
+        guard let logits = result.featureValue(for: "logits")?.multiArrayValue else {
+            throw NSError(domain: "LayoutLMv3", code: 5, userInfo: [NSLocalizedDescriptionKey: "Model did not return logits"])
+        }
+        let strides = logits.strides.map { $0.intValue }
+        let seqStride = strides.count > 2 ? strides[1] : numLabels
+        let labelStride = strides.count > 2 ? strides[2] : 1
+        var predictions: [Int] = []
+        for pos in 0..<seqLen {
+            var best: Float = -.infinity
+            var bestLabel = 0
+            if logits.dataType == .float16 {
+                let basePtr = UnsafePointer<Float16>(OpaquePointer(logits.dataPointer))
+                for l in 0..<numLabels {
+                    let val = Float(basePtr[pos * seqStride + l * labelStride])
+                    if val > best { best = val; bestLabel = l }
+                }
+            } else {
+                let basePtr = UnsafePointer<Float>(OpaquePointer(logits.dataPointer))
+                for l in 0..<numLabels {
+                    let val = basePtr[pos * seqStride + l * labelStride]
+                    if val > best { best = val; bestLabel = l }
+                }
+            }
+            predictions.append(bestLabel)
+        }
+        // Diagnostic: what did the model predict? (so we can see if it's all O or wrong label order)
+        var hist: [Int: Int] = [:]
+        for id in predictions { hist[id, default: 0] += 1 }
+        let histStr = (0..<numLabels).map { "\(layoutlmv3LabelNames[$0]):\(hist[$0] ?? 0)" }.joined(separator: " ")
+        print("[LayoutLMv3] Label histogram: \(histStr)")
+        let preview = (1..<min(31, predictions.count)).map { i in
+            let id = predictions[i]
+            let name = id < layoutlmv3LabelNames.count ? layoutlmv3LabelNames[id] : "O"
+            return "\(i):\(name)"
+        }.joined(separator: " ")
+        print("[LayoutLMv3] First 30 token predictions: \(preview)")
+        // BIO decode: token position i (1-based) maps to word via tokenToWordIndex[i-1] (one word can produce multiple tokens).
+        var fields: [KTCField] = []
+        var i = 1
+        let numContentTokens = tokenToWordIndex.count
+        while i < seqLen && i - 1 < numContentTokens {
+            let labelId = predictions[i]
+            let name = labelId < layoutlmv3LabelNames.count ? layoutlmv3LabelNames[labelId] : "O"
+            if name.hasPrefix("B-") {
+                var spanWordIndices: [Int] = [tokenToWordIndex[i - 1]]
+                i += 1
+                while i < seqLen && i - 1 < numContentTokens && predictions[i] == labelId + 1 {
+                    let wi = tokenToWordIndex[i - 1]
+                    if spanWordIndices.last != wi { spanWordIndices.append(wi) }
+                    i += 1
+                }
+                let text = spanWordIndices.map { wordBoxes[$0].word }.joined(separator: " ")
+                let spanBoxes = spanWordIndices.map { wordBoxes[$0].boundingBox }
+                let box = spanBoxes.reduce(spanBoxes[0]) { r, b in
+                    CGRect(x: min(r.minX, b.minX), y: min(r.minY, b.minY),
+                           width: max(r.maxX, b.maxX) - min(r.minX, b.minX),
+                           height: max(r.maxY, b.maxY) - min(r.minY, b.minY))
+                }
+                if name == "B-QUESTION" {
+                    fields.append(KTCField(label: text, labelBoundingBox: box))
+                } else if name == "B-ANSWER" {
+                    if !fields.isEmpty && fields[fields.count - 1].detectedValue == nil {
+                        fields[fields.count - 1].detectedValue = text
+                        fields[fields.count - 1].valueBoundingBox = box
+                    } else {
+                        var orphan = KTCField(label: "", labelBoundingBox: .zero)
+                        orphan.detectedValue = text
+                        orphan.valueBoundingBox = box
+                        fields.append(orphan)
+                    }
+                }
+            } else {
+                i += 1
+            }
+        }
+        let lines = wordBoxes.map { wb in
+            KTCRecognizedLine(text: wb.word, boundingBox: wb.boundingBox, confidence: 1, pageIndex: 0)
+        }
+        return (fields, lines)
+    }
+
     // MARK: - UDOP Pipeline (new way)
 
     private struct UDOPWordBox {
@@ -636,14 +909,17 @@ final class KTCDemo: ObservableObject {
                 udopLogger.info("[UDOP] Tokenizer ready (\(tokenizer.vocabSize) pieces)")
                 print("[UDOP] Tokenizer ready (\(tokenizer.vocabSize) pieces)")
 
-                // 2 — Core ML models
+                // 2 — Core ML models (load by URL; no generated UdopEncoder/UdopDecoder classes)
+                guard let encURL = Bundle.main.url(forResource: "UdopEncoder", withExtension: "mlpackage"),
+                      let decURL = Bundle.main.url(forResource: "UdopDecoder", withExtension: "mlpackage") else {
+                    throw NSError(domain: "UDOP", code: 2, userInfo: [NSLocalizedDescriptionKey: "UdopEncoder.mlpackage or UdopDecoder.mlpackage not found in bundle. Add them to Copy Bundle Resources."])
+                }
                 let eCfg = MLModelConfiguration()
                 eCfg.computeUnits = .all
-                let encoder = try UdopEncoder(configuration: eCfg)
-
+                let encoder = try MLModel(contentsOf: encURL, configuration: eCfg)
                 let dCfg = MLModelConfiguration()
                 dCfg.computeUnits = .all
-                let decoder = try UdopDecoder(configuration: dCfg)
+                let decoder = try MLModel(contentsOf: decURL, configuration: dCfg)
                 let modelLoadTime = String(format: "%.1f", CFAbsoluteTimeGetCurrent() - t0)
                 udopLogger.info("[UDOP] Models loaded in \(modelLoadTime)s")
                 print("[UDOP] Models loaded in \(modelLoadTime)s")
@@ -679,7 +955,7 @@ final class KTCDemo: ObservableObject {
                 // 6 — Encoder
                 let t1 = CFAbsoluteTimeGetCurrent()
                 let (hiddenStates, encMask) = try Self.udopEncode(
-                    model: encoder.model,
+                    model: encoder,
                     inputIds: inputIds, bboxes: bboxes,
                     mask: mask, pixels: pixels
                 )
@@ -690,7 +966,7 @@ final class KTCDemo: ObservableObject {
                 // 7 — Autoregressive decoder (greedy, up to 64 tokens)
                 let t2 = CFAbsoluteTimeGetCurrent()
                 let outputIds = try Self.udopDecode(
-                    model: decoder.model,
+                    model: decoder,
                     hiddenStates: hiddenStates,
                     encoderMask: encMask,
                     tokenizer: tokenizer,

@@ -20,6 +20,9 @@ class QwenInference: ObservableObject, @unchecked Sendable {
     @Published var isGenerating = false
     @Published var currentResponse = ""
     @Published var statusMessage = "Model not loaded"
+    /// Updated during generation; final value after completion. Reset when a new generation starts.
+    @Published var generatedTokenCount: Int = 0
+    @Published var tokensPerSecond: Double = 0
 
     private var model: OpaquePointer?
     private var ctx: OpaquePointer?
@@ -83,6 +86,8 @@ class QwenInference: ObservableObject, @unchecked Sendable {
         shouldStop = false
         isGenerating = true
         currentResponse = ""
+        generatedTokenCount = 0
+        tokensPerSecond = 0
 
         let prompt = formatChatPrompt(messages: messages)
 
@@ -143,6 +148,7 @@ class QwenInference: ObservableObject, @unchecked Sendable {
 
             var nCur = batch.n_tokens
             var responseBytes = Data()
+            let startTime = CFAbsoluteTimeGetCurrent()
 
             let maxGenTokens = min(max(8192 - nTokens, 256), 768)
             logger.info("Generation budget: \(maxGenTokens) tokens (capped at 768, thinking pre-filled)")
@@ -184,8 +190,12 @@ class QwenInference: ObservableObject, @unchecked Sendable {
                     if let decoded = String(data: responseBytes, encoding: .utf8) {
                         let cleaned = self.cleanResponse(decoded)
                         let display = cleaned.isEmpty ? "Thinking..." : cleaned
+                        let elapsed = CFAbsoluteTimeGetCurrent() - startTime
+                        let tps = elapsed > 0.001 ? Double(generatedCount) / elapsed : 0
                         DispatchQueue.main.async {
                             self.currentResponse = display
+                            self.generatedTokenCount = generatedCount
+                            self.tokensPerSecond = tps
                         }
                     }
                 }
@@ -217,8 +227,12 @@ class QwenInference: ObservableObject, @unchecked Sendable {
                 logger.warning("Response is EMPTY after cleaning — model may have only produced <think> tags")
             }
 
+            let elapsed = CFAbsoluteTimeGetCurrent() - startTime
+            let finalTps = elapsed > 0.001 ? Double(generatedCount) / elapsed : 0
             DispatchQueue.main.async {
                 self.currentResponse = finalText
+                self.generatedTokenCount = generatedCount
+                self.tokensPerSecond = finalTps
                 self.isGenerating = false
             }
         }

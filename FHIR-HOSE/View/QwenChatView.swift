@@ -162,6 +162,22 @@ struct OnDeviceChatView: View {
                     }
                 }
 
+                if selectedModel == .qwen, qwenInference.generatedTokenCount > 0 || qwenInference.isGenerating {
+                    HStack(spacing: 6) {
+                        Text("\(qwenInference.generatedTokenCount) tokens")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                        Text("·")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                        Text(String(format: "%.1f tok/s", qwenInference.tokensPerSecond))
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal)
+                }
+
                 Divider()
 
                 HStack(spacing: 12) {

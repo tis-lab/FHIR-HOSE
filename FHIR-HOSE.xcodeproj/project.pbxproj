@@ -38,16 +38,32 @@
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
 			membershipExceptions = (
 				Info.plist,
+				LayoutLMv3.mlpackage,
+				UdopDecoder.mlpackage,
+				UdopEncoder.mlpackage,
 			);
 			target = 41195D012CFFA99F00A188A9 /* FHIR-HOSE */;
 		};
 /* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
+
+/* Begin PBXFileSystemSynchronizedGroupBuildPhaseMembershipExceptionSet section */
+		00D3621C2F63083A00C797D5 /* Exceptions for "FHIR-HOSE" folder in "Copy Bundle Resources" phase from "FHIR-HOSE" target */ = {
+			isa = PBXFileSystemSynchronizedGroupBuildPhaseMembershipExceptionSet;
+			buildPhase = 41195D002CFFA99F00A188A9 /* Resources */;
+			membershipExceptions = (
+				LayoutLMv3.mlpackage,
+				UdopDecoder.mlpackage,
+				UdopEncoder.mlpackage,
+			);
+		};
+/* End PBXFileSystemSynchronizedGroupBuildPhaseMembershipExceptionSet section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		41195D042CFFA99F00A188A9 /* FHIR-HOSE */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			exceptions = (
 				41195D332CFFB1EC00A188A9 /* Exceptions for "FHIR-HOSE" folder in "FHIR-HOSE" target */,
+				00D3621C2F63083A00C797D5 /* Exceptions for "FHIR-HOSE" folder in "Copy Bundle Resources" phase from "FHIR-HOSE" target */,
 			);
 			explicitFileTypes = {
 				"inlined-minimum-fhir.json" = text.json;
