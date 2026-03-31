@@ -106,7 +106,7 @@ struct KTCOverlayView: View {
                                 )
                                 Text("X")
                                     .font(.system(size: max(10, min(16, rect.height * 0.8)), weight: .bold))
-                                    .foregroundColor(.green)
+                                    .foregroundColor(.black)
                                     .position(x: rect.midX, y: rect.midY)
                             }
                         }
@@ -360,7 +360,7 @@ struct SimpleDraggableSignature: View {
             .overlay(
                 Rectangle()
                     .stroke(
-                        editMode ? Color.orange : Color.green.opacity(0.5),
+                        editMode ? Color.orange : Color.black.opacity(0.5),
                         style: StrokeStyle(lineWidth: editMode ? 2 : 1, dash: editMode ? [] : [3])
                     )
             )

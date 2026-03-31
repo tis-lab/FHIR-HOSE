@@ -78,6 +78,7 @@ struct RawJSONView: View {
     var body: some View {
         Text(prettyPrintedJSON(data))
             .font(.system(.caption, design: .monospaced))
+            .textSelection(.enabled)
             .padding()
             .background(Color(.systemGray6))
             .cornerRadius(8)

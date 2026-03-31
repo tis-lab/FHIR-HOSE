@@ -68,6 +68,8 @@ class HealthRecordStore: ObservableObject {
             }
             if let fhirData = record.fhirData {
                 logInfo("   🩺 FHIR data keys: \(Array(fhirData.keys).joined(separator: ", "))")
+            } else if let fhirB64 = record.healthKitData?["fhirResource"] as? String, !fhirB64.isEmpty {
+                logInfo("   🩺 FHIR in fhirResource (base64)")
             } else {
                 logInfo("   ❌ No FHIR data in this HealthKit record")
             }

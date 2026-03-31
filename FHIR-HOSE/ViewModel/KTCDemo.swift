@@ -7,6 +7,7 @@
 
 import CoreML
 import Foundation
+import FoundationModels
 import NaturalLanguage
 import OSLog
 import UIKit
@@ -636,9 +637,9 @@ final class KTCDemo: ObservableObject {
                 log.info("[LayoutLMv3] Tokenizer loaded")
                 print("[LayoutLMv3] Tokenizer loaded")
 
-                // 2 — Core ML model (LayoutLMv3ForTokenClassification exported to .mlpackage)
-                guard let modelURL = Bundle.main.url(forResource: "LayoutLMv3", withExtension: "mlpackage", subdirectory: nil)
-                    ?? Bundle.main.url(forResource: "LayoutLMv3", withExtension: "mlmodelc", subdirectory: nil) else {
+                // 2 — Core ML model (Xcode compiles .mlpackage → .mlmodelc at build time)
+                guard let modelURL = Bundle.main.url(forResource: "LayoutLMv3", withExtension: "mlmodelc", subdirectory: nil)
+                    ?? Bundle.main.url(forResource: "LayoutLMv3", withExtension: "mlpackage", subdirectory: nil) else {
                     throw NSError(domain: "LayoutLMv3", code: 2,
                                   userInfo: [NSLocalizedDescriptionKey: "LayoutLMv3.mlpackage not found. Export LayoutLMv3ForTokenClassification (FUNSD) to Core ML and add to app bundle."])
                 }
@@ -688,18 +689,69 @@ final class KTCDemo: ObservableObject {
                 log.info("[LayoutLMv3] Decoded \(fieldsFromModel.count) fields, \(linesFromModel.count) lines")
                 print("[LayoutLMv3] Decoded \(fieldsFromModel.count) fields, \(linesFromModel.count) lines")
 
+                // Also run line-level OCR for heuristic field detection as fallback
+                let ocrLines = try await Self.performOCR(on: cgImage, pageIndex: 0)
+                let heuristicFields = Self.extractLabelCandidates(from: ocrLines)
+                let checkboxes = Self.detectCheckboxes(from: ocrLines)
+                var checkboxGroups = Self.groupCheckboxes(checkboxes, allLines: ocrLines)
+                log.info("[LayoutLMv3] Heuristic fallback: \(heuristicFields.count) fields, \(checkboxGroups.count) checkbox groups")
+                print("[LayoutLMv3] Heuristic fallback: \(heuristicFields.count) fields, \(checkboxGroups.count) checkbox groups")
+
+                // Merge: use model fields if any, otherwise fall back to heuristic
+                var detectedFields = fieldsFromModel.isEmpty ? heuristicFields : fieldsFromModel
+                if !fieldsFromModel.isEmpty {
+                    // Supplement model fields with heuristic fields it may have missed
+                    Self.classifyFieldTypes(&detectedFields, checkboxes: checkboxes, allLines: ocrLines)
+                    Self.associateValuesWithLabels(&detectedFields, allLines: ocrLines)
+                }
+
+                // Use display lines from OCR (more complete than word-level model lines)
+                let displayLines = ocrLines
+                let fullOCRText = ocrLines.map(\.text).joined(separator: "\n")
+
+                // Apple Intelligence: field values + checkbox groups
+                if #available(iOS 26, *) {
+                    let fieldsToQuery = detectedFields.enumerated().filter { (_, field) in
+                        field.fieldType != .checkbox && field.fieldType != .signature && field.detectedValue == nil
+                    }
+                    if !fieldsToQuery.isEmpty {
+                        log.info("[LayoutLMv3] \(fieldsToQuery.count) fields without values — querying AI")
+                        print("[LayoutLMv3] \(fieldsToQuery.count) fields without values — querying AI")
+                        let fieldLabels = fieldsToQuery.map { "\($0.offset): \($0.element.label)" }.joined(separator: "\n")
+                        let extracted = try await Self.extractFieldsWithAppleIntelligence(
+                            ocrText: fullOCRText, fieldLabels: fieldLabels, logger: log
+                        )
+                        for (idx, value) in extracted {
+                            if idx < detectedFields.count {
+                                detectedFields[idx].detectedValue = value
+                                detectedFields[idx].value = value
+                                print("[LayoutLMv3] AI filled [\(idx)] \(detectedFields[idx].label) = \"\(value)\"")
+                            }
+                        }
+                    }
+
+                    let aiCheckboxGroups = try await Self.detectCheckboxGroupsWithAI(
+                        ocrText: fullOCRText, logger: log
+                    )
+                    if !aiCheckboxGroups.isEmpty {
+                        checkboxGroups.append(contentsOf: aiCheckboxGroups)
+                        print("[LayoutLMv3] AI detected \(aiCheckboxGroups.count) checkbox groups, total: \(checkboxGroups.count)")
+                    }
+                }
+
                 let data = KTCPatientDataLoader.loadAndFlatten()
-                var detectedFields = fieldsFromModel
                 KTCPatientDataLoader.applyMappings(to: &detectedFields, using: data)
+                Self.autoCheckCheckboxGroups(&checkboxGroups, using: data)
 
                 await MainActor.run {
-                    self.recognizedLines = linesFromModel
+                    self.recognizedLines = displayLines
                     self.fields = detectedFields
-                    self.checkboxGroups = []
+                    self.checkboxGroups = checkboxGroups
                     self.patientData = data
                     let total = String(format: "%.1f", CFAbsoluteTimeGetCurrent() - t0)
-                    self.logger.info("[LayoutLMv3] Complete in \(total)s: \(detectedFields.count) fields")
-                    print("[LayoutLMv3] Complete in \(total)s: \(detectedFields.count) fields")
+                    let withValues = detectedFields.filter { $0.detectedValue != nil }.count
+                    self.logger.info("[LayoutLMv3] Complete in \(total)s: \(detectedFields.count) fields (\(withValues) with values), \(checkboxGroups.count) checkbox groups")
+                    print("[LayoutLMv3] Complete in \(total)s: \(detectedFields.count) fields (\(withValues) with values), \(checkboxGroups.count) checkbox groups")
                     UINotificationFeedbackGenerator().notificationOccurred(.success)
                     self.phase = .editing
                 }
@@ -900,101 +952,86 @@ final class KTCDemo: ObservableObject {
             let t0 = CFAbsoluteTimeGetCurrent()
 
             do {
-                // 1 — Tokenizer
-                guard let spURL = Bundle.main.url(forResource: "spiece", withExtension: "model") else {
-                    throw NSError(domain: "UDOP", code: 1,
-                                  userInfo: [NSLocalizedDescriptionKey: "spiece.model not found in bundle"])
+                // 1 — Line-level OCR for field detection
+                let lines = try await Self.performOCR(on: cgImage, pageIndex: 0)
+                udopLogger.info("[UDOP] Line OCR found \(lines.count) lines")
+                print("[UDOP] Line OCR found \(lines.count) lines")
+
+                // 2 — Standard field detection pipeline
+                var detectedFields = Self.extractLabelCandidates(from: lines)
+                let checkboxes = Self.detectCheckboxes(from: lines)
+                udopLogger.info("[UDOP] Text-based checkboxes: \(checkboxes.count)")
+                print("[UDOP] Text-based checkboxes: \(checkboxes.count)")
+
+                var checkboxGroups = Self.groupCheckboxes(checkboxes, allLines: lines)
+                Self.classifyFieldTypes(&detectedFields, checkboxes: checkboxes, allLines: lines)
+                Self.associateValuesWithLabels(&detectedFields, allLines: lines)
+                udopLogger.info("[UDOP] Heuristic detection: \(detectedFields.count) fields, \(checkboxGroups.count) checkbox groups")
+                print("[UDOP] Heuristic detection: \(detectedFields.count) fields, \(checkboxGroups.count) checkbox groups")
+
+                // 3 — Build full OCR text for Apple Intelligence
+                let fullOCRText = lines.map(\.text).joined(separator: "\n")
+
+                // 4 — Apple Intelligence: extract field values AND checkbox groups
+                if #available(iOS 26, *) {
+                    // 4a — Extract values for text fields missing them
+                    let fieldsToQuery = detectedFields.enumerated().filter { (_, field) in
+                        field.fieldType != .checkbox && field.fieldType != .signature && field.detectedValue == nil
+                    }
+                    if !fieldsToQuery.isEmpty {
+                        udopLogger.info("[UDOP] \(fieldsToQuery.count) fields without values — querying AI")
+                        print("[UDOP] \(fieldsToQuery.count) fields without values — querying AI")
+
+                        let fieldLabels = fieldsToQuery.map { "\($0.offset): \($0.element.label)" }.joined(separator: "\n")
+                        let extracted = try await Self.extractFieldsWithAppleIntelligence(
+                            ocrText: fullOCRText,
+                            fieldLabels: fieldLabels,
+                            logger: udopLogger
+                        )
+                        for (idx, value) in extracted {
+                            if idx < detectedFields.count {
+                                detectedFields[idx].detectedValue = value
+                                detectedFields[idx].value = value
+                                udopLogger.info("[UDOP] AI filled [\(idx)] \(detectedFields[idx].label) = \"\(value)\"")
+                                print("[UDOP] AI filled [\(idx)] \(detectedFields[idx].label) = \"\(value)\"")
+                            }
+                        }
+                    }
+
+                    // 4b — Detect checkbox groups from OCR text structure
+                    let aiCheckboxGroups = try await Self.detectCheckboxGroupsWithAI(
+                        ocrText: fullOCRText,
+                        logger: udopLogger
+                    )
+                    if !aiCheckboxGroups.isEmpty {
+                        checkboxGroups.append(contentsOf: aiCheckboxGroups)
+                        udopLogger.info("[UDOP] AI detected \(aiCheckboxGroups.count) checkbox groups, total: \(checkboxGroups.count)")
+                        print("[UDOP] AI detected \(aiCheckboxGroups.count) checkbox groups, total: \(checkboxGroups.count)")
+                    }
+                } else {
+                    udopLogger.warning("[UDOP] Apple Intelligence requires iOS 26+, skipping AI extraction")
+                    print("[UDOP] Apple Intelligence requires iOS 26+, skipping AI extraction")
                 }
-                let tokenizer = try SentencePieceTokenizer(modelURL: spURL)
-                udopLogger.info("[UDOP] Tokenizer ready (\(tokenizer.vocabSize) pieces)")
-                print("[UDOP] Tokenizer ready (\(tokenizer.vocabSize) pieces)")
 
-                // 2 — Core ML models (load by URL; no generated UdopEncoder/UdopDecoder classes)
-                guard let encURL = Bundle.main.url(forResource: "UdopEncoder", withExtension: "mlpackage"),
-                      let decURL = Bundle.main.url(forResource: "UdopDecoder", withExtension: "mlpackage") else {
-                    throw NSError(domain: "UDOP", code: 2, userInfo: [NSLocalizedDescriptionKey: "UdopEncoder.mlpackage or UdopDecoder.mlpackage not found in bundle. Add them to Copy Bundle Resources."])
-                }
-                let eCfg = MLModelConfiguration()
-                eCfg.computeUnits = .all
-                let encoder = try MLModel(contentsOf: encURL, configuration: eCfg)
-                let dCfg = MLModelConfiguration()
-                dCfg.computeUnits = .all
-                let decoder = try MLModel(contentsOf: decURL, configuration: dCfg)
-                let modelLoadTime = String(format: "%.1f", CFAbsoluteTimeGetCurrent() - t0)
-                udopLogger.info("[UDOP] Models loaded in \(modelLoadTime)s")
-                print("[UDOP] Models loaded in \(modelLoadTime)s")
-
-                // 3 — Word-level OCR
-                let words = try await Self.udopWordOCR(cgImage)
-                let ocrSnippet = words.prefix(30).map(\.word).joined(separator: " ")
-                udopLogger.info("[UDOP] OCR found \(words.count) words: \(ocrSnippet)…")
-                print("[UDOP] OCR found \(words.count) words: \(ocrSnippet)…")
-
-                // 4 — Tokenize + align bounding boxes (max 128 token slots)
-                let maxSeq = 128
-                // Match HuggingFace working example format: "Question answering. What is..."
-                let taskPrefix = "Question answering. What is the date on the form?"
-                print("[UDOP] Task prefix: \(taskPrefix)")
-                let (inputIds, bboxes, mask) = Self.udopTokenize(
-                    words: words, tokenizer: tokenizer, maxLength: maxSeq,
-                    taskPrefix: taskPrefix
-                )
-                let realTokenCount = mask.filter { $0 == 1 }.count
-                udopLogger.info("[UDOP] \(realTokenCount)/\(maxSeq) token slots used")
-                print("[UDOP] \(realTokenCount)/\(maxSeq) token slots used")
-
-                let previewIds = inputIds.prefix(min(20, realTokenCount))
-                let previewPieces = previewIds.map { tokenizer.pieceName(for: $0) }
-                print("[UDOP] First tokens: \(previewPieces.joined(separator: "|"))")
-                udopLogger.info("[UDOP] First tokens: \(previewPieces.joined(separator: "|"))")
-
-                // 5 — Image → pixel_values [1, 3, 512, 512]
-                let pixels = try Self.udopPreprocessImage(cgImage)
-                udopLogger.info("[UDOP] Image preprocessed to 512×512")
-
-                // 6 — Encoder
-                let t1 = CFAbsoluteTimeGetCurrent()
-                let (hiddenStates, encMask) = try Self.udopEncode(
-                    model: encoder,
-                    inputIds: inputIds, bboxes: bboxes,
-                    mask: mask, pixels: pixels
-                )
-                let encTime = String(format: "%.2f", CFAbsoluteTimeGetCurrent() - t1)
-                udopLogger.info("[UDOP] Encoder done in \(encTime)s  hidden=\(hiddenStates.shape)")
-                print("[UDOP] Encoder done in \(encTime)s  hidden=\(hiddenStates.shape)")
-
-                // 7 — Autoregressive decoder (greedy, up to 64 tokens)
-                let t2 = CFAbsoluteTimeGetCurrent()
-                let outputIds = try Self.udopDecode(
-                    model: decoder,
-                    hiddenStates: hiddenStates,
-                    encoderMask: encMask,
-                    tokenizer: tokenizer,
-                    maxTokens: 64,
-                    logger: udopLogger
-                )
-                let outputText = tokenizer.decode(outputIds)
-                let decTime = String(format: "%.2f", CFAbsoluteTimeGetCurrent() - t2)
-                udopLogger.info("[UDOP] Decoder done in \(decTime)s")
-                udopLogger.info("[UDOP] Output text (\(outputIds.count) tokens): \(outputText)")
-                udopLogger.info("[UDOP] Output IDs: \(outputIds.map(String.init).joined(separator: ","))")
-                print("[UDOP] Decoder done in \(decTime)s")
-                print("[UDOP] Output text (\(outputIds.count) tokens): \(outputText)")
-                print("[UDOP] Output IDs: \(outputIds.map(String.init).joined(separator: ","))")
+                // 6 — Apply patient data mappings and auto-check checkboxes
+                let data = KTCPatientDataLoader.loadAndFlatten()
+                KTCPatientDataLoader.applyMappings(to: &detectedFields, using: data)
+                Self.autoCheckCheckboxGroups(&checkboxGroups, using: data)
 
                 let total = String(format: "%.2f", CFAbsoluteTimeGetCurrent() - t0)
                 udopLogger.info("[UDOP] Full pipeline completed in \(total)s")
                 print("[UDOP] Full pipeline completed in \(total)s")
 
-                // 8 — Transition to editing
-                let data = KTCPatientDataLoader.loadAndFlatten()
-
+                // 7 — Transition to editing with populated data
                 await MainActor.run {
-                    self.recognizedLines = []
-                    self.fields = []
-                    self.checkboxGroups = []
+                    self.recognizedLines = lines
+                    self.fields = detectedFields
+                    self.checkboxGroups = checkboxGroups
                     self.patientData = data
-                    udopLogger.info("[UDOP] → editing phase  keypaths=\(data.count)  decoder_output=\"\(outputText)\"")
+                    let withValues = detectedFields.filter { $0.detectedValue != nil }.count
+                    let checkboxFieldCount = detectedFields.filter { $0.fieldType == .checkbox }.count
+                    let autoChecked = checkboxGroups.filter { $0.selectedIndex != nil }.count
+                    udopLogger.info("[UDOP] → editing phase: \(lines.count) lines, \(detectedFields.count) fields (\(withValues) with values, \(checkboxFieldCount) checkboxes, \(checkboxGroups.count) groups, \(autoChecked) auto-checked), \(data.count) keypaths")
                     UINotificationFeedbackGenerator().notificationOccurred(.success)
                     self.phase = .editing
                 }
@@ -1010,6 +1047,406 @@ final class KTCDemo: ObservableObject {
                 }
             }
         }
+    }
+
+    // MARK: - Apple Intelligence Field Extraction
+
+    /// Ask Apple Intelligence to extract field values from OCR text.
+    /// Returns array of (fieldIndex, extractedValue) pairs.
+    @available(iOS 26, macOS 26, visionOS 26, *)
+    private nonisolated static func extractFieldsWithAppleIntelligence(
+        ocrText: String,
+        fieldLabels: String,
+        logger: Logger
+    ) async throws -> [(Int, String)] {
+        let session = LanguageModelSession(instructions: """
+            You are a form field extractor. Given OCR text from a scanned form and a list of field labels, \
+            extract the value for each field from the text. If a field's value is not present or the field \
+            is blank on the form, skip it. Respond ONLY with lines in the format: INDEX|VALUE
+            Do not include any other text, explanations, or empty lines.
+            """)
+
+        let prompt = """
+            OCR TEXT:
+            \(ocrText)
+
+            FIELDS TO EXTRACT (index: label):
+            \(fieldLabels)
+
+            Extract the value for each field. Respond with INDEX|VALUE lines only:
+            """
+
+        logger.info("[UDOP] Apple Intelligence prompt length: \(prompt.count) chars")
+        print("[UDOP] Apple Intelligence prompt length: \(prompt.count) chars")
+
+        let t0 = CFAbsoluteTimeGetCurrent()
+        let response = try await session.respond(to: prompt)
+        let responseText = response.content
+        let elapsed = String(format: "%.2f", CFAbsoluteTimeGetCurrent() - t0)
+        logger.info("[UDOP] Apple Intelligence responded in \(elapsed)s: \(responseText)")
+        print("[UDOP] Apple Intelligence responded in \(elapsed)s:\n\(responseText)")
+
+        // Parse INDEX|VALUE lines
+        var results: [(Int, String)] = []
+        for line in responseText.components(separatedBy: .newlines) {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            guard !trimmed.isEmpty else { continue }
+            let parts = trimmed.split(separator: "|", maxSplits: 1)
+            guard parts.count == 2,
+                  let idx = Int(parts[0].trimmingCharacters(in: .whitespaces)) else { continue }
+            let value = parts[1].trimmingCharacters(in: .whitespaces)
+            if !value.isEmpty {
+                results.append((idx, value))
+            }
+        }
+        return results
+    }
+
+    // MARK: - Apple Intelligence Checkbox Group Detection
+
+    /// Ask Apple Intelligence to identify checkbox/radio groups from OCR text.
+    /// Returns KTCCheckboxGroup objects with options parsed from the AI response.
+    @available(iOS 26, macOS 26, visionOS 26, *)
+    private nonisolated static func detectCheckboxGroupsWithAI(
+        ocrText: String,
+        logger: Logger
+    ) async throws -> [KTCCheckboxGroup] {
+        let session = LanguageModelSession(instructions: """
+            You are a form structure analyzer. Given OCR text from a scanned form, identify all \
+            checkbox or radio-button groups that ACTUALLY APPEAR in the text. These are places where \
+            a user must select one or more options from a list. They often look like: \
+            "Label: □ Option1 □ Option2 □ Option3" or "Label: Option1 Option2 Option3" \
+            (the □ symbols may be missing or read as 'o' or 'D').
+
+            IMPORTANT: Only report groups whose label AND options are explicitly present in the OCR text. \
+            Do NOT invent or guess groups that are not in the text. If the text does not mention \
+            "Marital Status" anywhere, do not include a Marital Status group.
+
+            Respond ONLY with lines in this format, one per group:
+            GROUP_LABEL|OPTION1,OPTION2,OPTION3
+
+            Do not include any other text or explanations.
+            """)
+
+        let prompt = """
+            Identify all checkbox/radio groups in this form text. Only include groups \
+            whose labels and options actually appear in the text below:
+
+            \(ocrText)
+            """
+
+        logger.info("[Checkbox-AI] Prompt length: \(prompt.count) chars")
+        print("[Checkbox-AI] Prompt length: \(prompt.count) chars")
+
+        let t0 = CFAbsoluteTimeGetCurrent()
+        let response = try await session.respond(to: prompt)
+        let responseText = response.content
+        let elapsed = String(format: "%.2f", CFAbsoluteTimeGetCurrent() - t0)
+        logger.info("[Checkbox-AI] Responded in \(elapsed)s:\n\(responseText)")
+        print("[Checkbox-AI] Responded in \(elapsed)s:\n\(responseText)")
+
+        let ocrLower = ocrText.lowercased()
+
+        // Parse GROUP_LABEL|OPTION1,OPTION2,OPTION3 lines
+        var groups: [KTCCheckboxGroup] = []
+        for line in responseText.components(separatedBy: .newlines) {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            guard !trimmed.isEmpty else { continue }
+            let parts = trimmed.split(separator: "|", maxSplits: 1)
+            guard parts.count == 2 else { continue }
+
+            let groupLabel = parts[0].trimmingCharacters(in: .whitespaces)
+            let optionStrings = parts[1].split(separator: ",").map {
+                $0.trimmingCharacters(in: .whitespaces)
+            }.filter { !$0.isEmpty }
+
+            guard !optionStrings.isEmpty else { continue }
+
+            // Validate: at least 2 options must actually appear in the OCR text
+            let matchingOptions = optionStrings.filter { ocrLower.contains($0.lowercased()) }
+            if matchingOptions.count < 2 {
+                logger.info("[Checkbox-AI] Skipped hallucinated group: \(groupLabel) (only \(matchingOptions.count) options found in text)")
+                print("[Checkbox-AI] Skipped hallucinated group: \(groupLabel) (only \(matchingOptions.count)/\(optionStrings.count) options in text)")
+                continue
+            }
+
+            // Only use the options that actually appear in the OCR text
+            let validOptions = optionStrings.filter { ocrLower.contains($0.lowercased()) }
+
+            let options = validOptions.map { optText in
+                KTCCheckbox(
+                    boundingBox: .zero,
+                    isChecked: false,
+                    associatedText: optText
+                )
+            }
+
+            var group = KTCCheckboxGroup(
+                boundingBox: .zero,
+                options: options,
+                groupLabel: groupLabel
+            )
+
+            // Try to match to known patient data keypaths
+            let labelLower = groupLabel.lowercased()
+            if labelLower.contains("gender") || labelLower.contains("sex") {
+                group.mappedKeypath = "patient.sex"
+            } else if labelLower.contains("marital") {
+                group.mappedKeypath = "patient.maritalStatus"
+            } else if labelLower.contains("race") || labelLower.contains("ethnicity") {
+                group.mappedKeypath = "patient.race"
+            }
+
+            groups.append(group)
+            logger.info("[Checkbox-AI] Group: \(groupLabel) → \(validOptions.joined(separator: ", ")) (\(validOptions.count)/\(optionStrings.count) validated)")
+            print("[Checkbox-AI] Group: \(groupLabel) → \(validOptions.joined(separator: ", ")) (\(validOptions.count)/\(optionStrings.count) validated)")
+        }
+
+        return groups
+    }
+
+    // MARK: - Visual Checkbox Detection
+
+    /// Detect unfilled checkbox squares and circles in a scanned form image
+    /// using Vision contour detection. Returns bounding boxes in Vision
+    /// normalized coordinates (0-1, bottom-left origin).
+    private nonisolated static func detectCheckboxShapes(
+        in cgImage: CGImage,
+        ocrLines: [KTCRecognizedLine] = [],
+        logger: Logger
+    ) throws -> [CGRect] {
+        let request = VNDetectContoursRequest()
+        request.contrastAdjustment = 2.0
+        request.detectsDarkOnLight = true
+        request.maximumImageDimension = 1024
+
+        let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+        try handler.perform([request])
+
+        guard let observation = request.results?.first else {
+            logger.info("[Checkbox] No contours found")
+            return []
+        }
+
+        logger.info("[Checkbox] Total contours detected: \(observation.contourCount)")
+        print("[Checkbox] Total contours detected: \(observation.contourCount)")
+
+        // Checkbox size range in normalized coords.
+        // Real checkboxes on a letter-size form are ~12-30px, which at ~1700px wide
+        // is 0.007–0.018. Bump minimum up to avoid letter components.
+        let minDim: CGFloat = 0.008
+        let maxDim: CGFloat = 0.035
+
+        var candidates: [CGRect] = []
+
+        func evaluateContour(_ contour: VNContour) {
+            let bounds = contour.normalizedPath.boundingBox
+            let w = bounds.width
+            let h = bounds.height
+
+            guard w > minDim, w < maxDim, h > minDim, h < maxDim else { return }
+
+            // Tight aspect ratio — checkboxes are very square
+            let aspect = w / h
+            guard aspect > 0.75, aspect < 1.35 else { return }
+
+            guard contour.pointCount >= 4 else { return }
+
+            candidates.append(bounds)
+        }
+
+        // Walk the contour tree
+        for topIdx in 0..<observation.topLevelContourCount {
+            guard let top = try? observation.contour(at: topIdx) else { continue }
+            evaluateContour(top)
+            for childIdx in 0..<top.childContourCount {
+                guard let child = try? top.childContour(at: childIdx) else { continue }
+                evaluateContour(child)
+                for grandIdx in 0..<child.childContourCount {
+                    guard let grand = try? child.childContour(at: grandIdx) else { continue }
+                    evaluateContour(grand)
+                }
+            }
+        }
+
+        logger.info("[Checkbox] Shape candidates after size/aspect filter: \(candidates.count)")
+        print("[Checkbox] Shape candidates after size/aspect filter: \(candidates.count)")
+
+        // --- Key filter: remove candidates embedded WITHIN OCR text lines ---
+        // Real checkboxes sit at the left edge of (or just before) their text label.
+        // Letter components (o, e, a, d loops) are surrounded by other text on both sides.
+        // Check: if a candidate's bounding box is fully inside an OCR line box and
+        // there is text on BOTH its left AND right sides within that line, it's a letter.
+        let textFiltered: [CGRect]
+        if !ocrLines.isEmpty {
+            textFiltered = candidates.filter { cb in
+                for line in ocrLines {
+                    let lb = line.boundingBox
+                    // Is the candidate inside this OCR line vertically?
+                    let vertInside = cb.midY > lb.minY - lb.height * 0.3 &&
+                                     cb.midY < lb.maxY + lb.height * 0.3
+                    guard vertInside else { continue }
+
+                    // How much of the line is to the LEFT vs RIGHT of the candidate?
+                    let spaceLeft = cb.minX - lb.minX
+                    let spaceRight = lb.maxX - cb.maxX
+
+                    // If there's significant text on BOTH sides, it's embedded in text
+                    // (a checkbox would be at the start of the text, so very little to the left)
+                    let lineWidth = lb.width
+                    guard lineWidth > 0 else { continue }
+                    let leftFraction = spaceLeft / lineWidth
+                    let rightFraction = spaceRight / lineWidth
+
+                    // If >10% of line on left AND >10% on right → likely a letter component
+                    if leftFraction > 0.10 && rightFraction > 0.10 {
+                        return false // reject — it's inside text
+                    }
+                }
+                return true // keep — not embedded in text
+            }
+            logger.info("[Checkbox] After text-embedding filter: \(textFiltered.count) (removed \(candidates.count - textFiltered.count) embedded in text)")
+            print("[Checkbox] After text-embedding filter: \(textFiltered.count)")
+        } else {
+            textFiltered = candidates
+        }
+
+        // --- Hollowness check: real checkboxes have a light interior ---
+        let hollowFiltered = textFiltered.filter { rect in
+            !isCheckboxFilled(cgImage: cgImage, normalizedRect: rect)
+        }
+        logger.info("[Checkbox] After hollowness filter (unfilled only): \(hollowFiltered.count)")
+        print("[Checkbox] After hollowness filter: \(hollowFiltered.count)")
+
+        // Deduplicate overlapping detections
+        var deduped: [CGRect] = []
+        var used = [Bool](repeating: false, count: hollowFiltered.count)
+        for i in 0..<hollowFiltered.count {
+            guard !used[i] else { continue }
+            var best = hollowFiltered[i]
+            for j in (i + 1)..<hollowFiltered.count {
+                guard !used[j] else { continue }
+                if overlaps(best, hollowFiltered[j], threshold: 0.5) {
+                    used[j] = true
+                    let aI = best.width / best.height
+                    let aJ = hollowFiltered[j].width / hollowFiltered[j].height
+                    if abs(aJ - 1.0) < abs(aI - 1.0) { best = hollowFiltered[j] }
+                }
+            }
+            deduped.append(best)
+        }
+
+        logger.info("[Checkbox] Final checkbox candidates: \(deduped.count)")
+        print("[Checkbox] Final checkbox candidates: \(deduped.count)")
+        for (i, r) in deduped.prefix(30).enumerated() {
+            print("[Checkbox]   [\(i)] x=\(String(format: "%.3f", r.minX)) y=\(String(format: "%.3f", r.minY)) w=\(String(format: "%.3f", r.width)) h=\(String(format: "%.3f", r.height))")
+        }
+
+        return deduped
+    }
+
+    /// Check if two rects overlap by more than `threshold` fraction of the smaller rect's area.
+    private nonisolated static func overlaps(_ a: CGRect, _ b: CGRect, threshold: CGFloat) -> Bool {
+        let intersection = a.intersection(b)
+        guard !intersection.isNull else { return false }
+        let interArea = intersection.width * intersection.height
+        let smallerArea = min(a.width * a.height, b.width * b.height)
+        return smallerArea > 0 && interArea / smallerArea > threshold
+    }
+
+    /// Check if a detected checkbox region is filled (checked) by examining pixel intensity.
+    /// Returns true if the interior is mostly dark (filled/checked).
+    private nonisolated static func isCheckboxFilled(
+        cgImage: CGImage,
+        normalizedRect: CGRect
+    ) -> Bool {
+        let imgW = CGFloat(cgImage.width)
+        let imgH = CGFloat(cgImage.height)
+
+        // Convert Vision coords (bottom-left) to pixel coords (top-left)
+        let pixelX = Int(normalizedRect.minX * imgW)
+        let pixelY = Int((1.0 - normalizedRect.maxY) * imgH)
+        let pixelW = max(1, Int(normalizedRect.width * imgW))
+        let pixelH = max(1, Int(normalizedRect.height * imgH))
+
+        // Inset slightly to avoid the border itself
+        let inset = max(1, min(pixelW, pixelH) / 4)
+        let innerX = pixelX + inset
+        let innerY = pixelY + inset
+        let innerW = max(1, pixelW - inset * 2)
+        let innerH = max(1, pixelH - inset * 2)
+
+        guard let cropped = cgImage.cropping(to: CGRect(x: innerX, y: innerY, width: innerW, height: innerH)) else {
+            return false
+        }
+
+        // Render to grayscale and compute average intensity
+        let w = cropped.width
+        let h = cropped.height
+        guard let ctx = CGContext(
+            data: nil, width: w, height: h,
+            bitsPerComponent: 8, bytesPerRow: w,
+            space: CGColorSpaceCreateDeviceGray(),
+            bitmapInfo: CGImageAlphaInfo.none.rawValue
+        ) else { return false }
+
+        ctx.draw(cropped, in: CGRect(x: 0, y: 0, width: w, height: h))
+        guard let data = ctx.data else { return false }
+
+        let pixels = data.bindMemory(to: UInt8.self, capacity: w * h)
+        var totalBrightness: Int = 0
+        for i in 0..<(w * h) {
+            totalBrightness += Int(pixels[i])
+        }
+        let avgBrightness = CGFloat(totalBrightness) / CGFloat(w * h) / 255.0
+
+        // If average brightness < 0.65, the interior is mostly dark → filled
+        return avgBrightness < 0.65
+    }
+
+    /// Associate detected checkbox shapes with nearby OCR text to create KTCCheckbox objects.
+    private nonisolated static func associateCheckboxesWithText(
+        shapes: [CGRect],
+        cgImage: CGImage,
+        lines: [KTCRecognizedLine],
+        logger: Logger
+    ) -> [KTCCheckbox] {
+        var checkboxes: [KTCCheckbox] = []
+
+        for shape in shapes {
+            let filled = isCheckboxFilled(cgImage: cgImage, normalizedRect: shape)
+
+            // Find the closest OCR text to the RIGHT of or immediately after this checkbox
+            var bestText: String?
+            var bestDistance: CGFloat = .infinity
+
+            for line in lines {
+                let lineBox = line.boundingBox
+                // Text should be roughly on the same vertical line
+                let verticalOverlap = abs(lineBox.midY - shape.midY) < shape.height * 2.0
+
+                if verticalOverlap {
+                    // Text to the right of the checkbox
+                    let horizDist = lineBox.minX - shape.maxX
+                    if horizDist > -shape.width * 0.5 && horizDist < 0.15 && horizDist < bestDistance {
+                        bestDistance = horizDist
+                        // Take just the first few words that are close
+                        let words = line.text.components(separatedBy: .whitespaces).filter { !$0.isEmpty }
+                        bestText = words.prefix(3).joined(separator: " ")
+                    }
+                }
+            }
+
+            logger.info("[Checkbox] shape at (\(String(format: "%.3f", shape.midX)), \(String(format: "%.3f", shape.midY))) filled=\(filled) text=\"\(bestText ?? "nil")\"")
+
+            checkboxes.append(KTCCheckbox(
+                boundingBox: shape,
+                isChecked: filled,
+                associatedText: bestText
+            ))
+        }
+
+        return checkboxes
     }
 
     // MARK: - UDOP Helpers

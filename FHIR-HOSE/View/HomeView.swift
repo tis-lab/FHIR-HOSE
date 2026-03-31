@@ -87,6 +87,16 @@ struct HomeView: View {
                 }
                 .buttonStyle(PlainButtonStyle())
 
+                NavigationLink(destination: DeIDTestView(recordStore: recordStore)) {
+                    HealthAppCard(
+                        title: "FHIR De-ID Test",
+                        subtitle: "De-identify FHIR-JSON on device",
+                        systemImage: "lock.shield",
+                        color: .orange
+                    )
+                }
+                .buttonStyle(PlainButtonStyle())
+
                 if #available(iOS 26, macOS 26, visionOS 26, *) {
                     NavigationLink(destination: OnDeviceChatView(recordStore: recordStore)) {
                         HealthAppCard(

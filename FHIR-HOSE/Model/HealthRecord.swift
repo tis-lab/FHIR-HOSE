@@ -8,7 +8,7 @@
 import Foundation
 import HealthKit
 
-struct HealthRecord: Identifiable {
+struct HealthRecord: Identifiable, Hashable, Equatable {
     let id = UUID()
     let filename: String
     let type: RecordType
@@ -42,5 +42,13 @@ struct HealthRecord: Identifiable {
     init(filename: String, type: RecordType) {
         self.filename = filename
         self.type = type
+    }
+
+    static func == (lhs: HealthRecord, rhs: HealthRecord) -> Bool {
+        lhs.id == rhs.id
+    }
+
+    func hash(into hasher: inout Hasher) {
+        hasher.combine(id)
     }
 }

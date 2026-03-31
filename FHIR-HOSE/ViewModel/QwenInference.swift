@@ -80,8 +80,9 @@ class QwenInference: ObservableObject, @unchecked Sendable {
         }
     }
 
-    func generate(messages: [ChatMessage]) {
-        guard isModelLoaded, !isGenerating else { return }
+    /// If `completion` is non-nil, it is called on the main queue with the full assistant response when generation finishes (for one-shot tasks like de-ID).
+    func generate(messages: [ChatMessage], completion: ((String) -> Void)? = nil) {
+        guard isModelLoaded, !isGenerating else { completion?(""); return }
 
         shouldStop = false
         isGenerating = true
@@ -99,7 +100,10 @@ class QwenInference: ObservableObject, @unchecked Sendable {
 
         queue.async {
             guard let model = self.model, let ctx = self.ctx else {
-                DispatchQueue.main.async { self.isGenerating = false }
+                DispatchQueue.main.async {
+                    self.isGenerating = false
+                    completion?("")
+                }
                 return
             }
 
@@ -116,6 +120,7 @@ class QwenInference: ObservableObject, @unchecked Sendable {
                 DispatchQueue.main.async {
                     self.currentResponse = "[Tokenization failed]"
                     self.isGenerating = false
+                    completion?("")
                 }
                 return
             }
@@ -142,6 +147,7 @@ class QwenInference: ObservableObject, @unchecked Sendable {
                 DispatchQueue.main.async {
                     self.currentResponse = "[Prompt decode failed]"
                     self.isGenerating = false
+                    completion?("")
                 }
                 return
             }
@@ -150,8 +156,11 @@ class QwenInference: ObservableObject, @unchecked Sendable {
             var responseBytes = Data()
             let startTime = CFAbsoluteTimeGetCurrent()
 
-            let maxGenTokens = min(max(8192 - nTokens, 256), 768)
-            logger.info("Generation budget: \(maxGenTokens) tokens (capped at 768, thinking pre-filled)")
+            let tokenBudget = 8192 - nTokens
+            let maxGenTokens = completion != nil
+                ? min(max(tokenBudget, 256), 4096)
+                : min(max(tokenBudget, 256), 768)
+            logger.info("Generation budget: \(maxGenTokens) tokens (thinking pre-filled)")
             var generatedCount = 0
             for _ in 0..<maxGenTokens {
                 if self.shouldStop { break }
@@ -234,6 +243,7 @@ class QwenInference: ObservableObject, @unchecked Sendable {
                 self.generatedTokenCount = generatedCount
                 self.tokensPerSecond = finalTps
                 self.isGenerating = false
+                completion?(finalText)
             }
         }
     }

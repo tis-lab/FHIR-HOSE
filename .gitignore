@@ -20,3 +20,6 @@ logs/
 *.gguf
 *.mlpackage
 *.model
+
+# Local docs (not published in public repo)
+FHIR-HOSE/Docs/
