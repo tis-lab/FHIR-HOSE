@@ -46,6 +46,10 @@ struct KTCDemoView: View {
     @State private var showPDFPreview = false
     @State private var previewPDFURL: URL?
     @State private var showStartOverConfirmation = false
+    @State private var showDebugOverlay = false
+    @State private var showDataScanner = false
+    @State private var dataScannerTargetFieldId: UUID? = nil
+    @State private var showLiveText = false
     private let logger = Logger(subsystem: "com.fhirhose.app", category: "KTCDemoView")
 
     // Completion tracking
@@ -107,7 +111,8 @@ struct KTCDemoView: View {
                     fields: vm.fields,
                     checkboxGroups: vm.checkboxGroups,
                     showLabelBoxes: $showLabelBoxes,
-                    vm: vm
+                    vm: vm,
+                    showDebugOverlay: showDebugOverlay
                 )
             }
         }
@@ -131,6 +136,62 @@ struct KTCDemoView: View {
                         showPDFPreview = false
                     }
                 )
+            }
+        }
+        .sheet(isPresented: $showDataScanner) {
+            if KTCDataScanner.isSupported {
+                NavigationView {
+                    KTCDataScanner(
+                        onTextCaptured: { text in
+                            if let fieldId = dataScannerTargetFieldId,
+                               let idx = vm.fields.firstIndex(where: { $0.id == fieldId }) {
+                                vm.fields[idx].value = text
+                                vm.fields[idx].detectedValue = text
+                                Haptics.success()
+                            }
+                            showDataScanner = false
+                            dataScannerTargetFieldId = nil
+                        },
+                        onCancel: {
+                            showDataScanner = false
+                            dataScannerTargetFieldId = nil
+                        }
+                    )
+                    .navigationTitle("Scan Value")
+                    .navigationBarTitleDisplayMode(.inline)
+                    .toolbar {
+                        ToolbarItem(placement: .cancellationAction) {
+                            Button("Cancel") {
+                                showDataScanner = false
+                                dataScannerTargetFieldId = nil
+                            }
+                        }
+                    }
+                }
+            } else {
+                VStack(spacing: 16) {
+                    Image(systemName: "camera.fill")
+                        .font(.largeTitle)
+                        .foregroundColor(.secondary)
+                    Text("DataScanner not available on this device")
+                        .font(.headline)
+                    Button("Dismiss") { showDataScanner = false }
+                }
+                .padding()
+            }
+        }
+        .sheet(isPresented: $showLiveText) {
+            if let firstPage = vm.pages.first {
+                NavigationView {
+                    KTCLiveTextView(image: firstPage)
+                        .navigationTitle("Live Text")
+                        .navigationBarTitleDisplayMode(.inline)
+                        .toolbar {
+                            ToolbarItem(placement: .confirmationAction) {
+                                Button("Done") { showLiveText = false }
+                            }
+                        }
+                }
             }
         }
         .fullScreenCover(isPresented: $showSignatureCanvas) {
@@ -278,7 +339,9 @@ struct KTCDemoView: View {
                         signatureImage: vm.hasSignature ? vm.signatureImage : nil,
                         signatureField: vm.signatureField,
                         signatureSize: vm.signatureSize,
-                        signatureNormalizedPos: vm.signatureNormalizedPosition
+                        signatureNormalizedPos: vm.signatureNormalizedPosition,
+                        debugRects: showDebugOverlay ? vm.debugRects : [],
+                        debugOCRLines: showDebugOverlay ? vm.recognizedLines : []
                     )
                     .frame(height: 220)
                     .cornerRadius(8)
@@ -293,6 +356,33 @@ struct KTCDemoView: View {
                             .background(.ultraThinMaterial)
                             .cornerRadius(6)
                             .padding(8)
+                    }
+                }
+
+                // v2 tools: Live Text
+                if vm.backend == .visionOCRv2 {
+                    Button {
+                        showLiveText = true
+                    } label: {
+                        Label("Open Live Text View", systemImage: "text.viewfinder")
+                            .font(.caption)
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(.blue)
+                }
+
+                // Debug toggle (only visible for Vision OCR v2)
+                if vm.backend == .visionOCRv2 {
+                    Toggle(isOn: $showDebugOverlay) {
+                        Label("Debug: Show Detected Rectangles", systemImage: "rectangle.dashed")
+                            .font(.caption)
+                    }
+                    .toggleStyle(.switch)
+                    .tint(.orange)
+                    .padding(.horizontal, 4)
+
+                    if showDebugOverlay {
+                        debugLegend
                     }
                 }
 
@@ -410,7 +500,7 @@ struct KTCDemoView: View {
                         ForEach($vm.fields) { $field in
                             if field.fieldType != .signature && field.fieldType != .checkbox &&
                                (field.isSkipped || (field.mappedKeypath != nil && !field.value.isEmpty)) {
-                                KTCFieldCard(field: $field, vm: vm)
+                                KTCFieldCard(field: $field, vm: vm, onScanValue: scanValueHandler)
                             }
                         }
                     }
@@ -439,7 +529,7 @@ struct KTCDemoView: View {
                         ForEach($vm.fields) { $field in
                             if field.fieldType != .signature && field.fieldType != .checkbox &&
                                !field.isSkipped && (field.mappedKeypath == nil || field.value.isEmpty) {
-                                KTCFieldCard(field: $field, vm: vm)
+                                KTCFieldCard(field: $field, vm: vm, onScanValue: scanValueHandler)
                             }
                         }
                     }
@@ -540,6 +630,53 @@ struct KTCDemoView: View {
                 .transition(.move(edge: .bottom).combined(with: .opacity))
                 .animation(.easeInOut, value: showCopiedToast)
             }
+        }
+    }
+
+    /// Returns a scan-value closure for v2 + DataScanner, or nil otherwise.
+    private var scanValueHandler: ((UUID) -> Void)? {
+        guard vm.backend == .visionOCRv2, KTCDataScanner.isSupported else { return nil }
+        return { fieldId in
+            dataScannerTargetFieldId = fieldId
+            showDataScanner = true
+        }
+    }
+
+    // MARK: - Debug Legend
+
+    private var debugLegend: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Detection Debug")
+                .font(.caption.bold())
+
+            let checkboxCount = vm.debugRects.filter { $0.type == .checkbox }.count
+            let textFieldCount = vm.debugRects.filter { $0.type == .textField }.count
+            let sigCount = vm.debugRects.filter { $0.type == .signatureLine }.count
+            let ocrCount = vm.recognizedLines.count
+
+            HStack(spacing: 12) {
+                legendDot(color: .green, label: "Checkbox (\(checkboxCount))")
+                legendDot(color: .blue, label: "Text Field (\(textFieldCount))")
+                legendDot(color: .orange, label: "Signature (\(sigCount))")
+            }
+            HStack(spacing: 12) {
+                legendDot(color: .yellow, label: "OCR Lines (\(ocrCount))")
+                legendDot(color: .indigo, label: "Field Labels (\(vm.fields.count))")
+            }
+
+            Text("\(vm.debugRects.count) rects total, \(vm.fields.count) fields, \(vm.checkboxGroups.count) checkbox groups")
+                .font(.caption2)
+                .foregroundColor(.secondary)
+        }
+        .padding(8)
+        .background(Color(.systemGray6))
+        .cornerRadius(8)
+    }
+
+    private func legendDot(color: Color, label: String) -> some View {
+        HStack(spacing: 4) {
+            Circle().fill(color).frame(width: 8, height: 8)
+            Text(label).font(.caption2)
         }
     }
 
@@ -717,6 +854,7 @@ struct KTCDemoView: View {
 struct KTCFieldCard: View {
     @Binding var field: KTCField
     @ObservedObject var vm: KTCDemo
+    var onScanValue: ((UUID) -> Void)? = nil
 
     @State private var isExpanded = false
 
@@ -828,6 +966,18 @@ struct KTCFieldCard: View {
                             .buttonStyle(.bordered)
                             .tint(.indigo)
                         }
+                    }
+
+                    // Quick scan button (DataScanner) for v2 backend
+                    if let onScan = onScanValue {
+                        Button {
+                            onScan(field.id)
+                        } label: {
+                            Label("Scan Value with Camera", systemImage: "camera.viewfinder")
+                                .font(.caption)
+                        }
+                        .buttonStyle(.bordered)
+                        .tint(.blue)
                     }
 
                     // Show detected value if different from current
@@ -1320,11 +1470,5 @@ struct SignatureCanvasRepresentable: UIViewRepresentable {
         if signatureImage == nil && uiView.hasSignature {
             uiView.clear()
         }
-    }
-}
-
-#Preview {
-    NavigationView {
-        KTCDemoView()
     }
 }

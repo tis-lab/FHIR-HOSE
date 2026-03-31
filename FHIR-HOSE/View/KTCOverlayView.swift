@@ -32,6 +32,10 @@ struct KTCOverlayView: View {
     // Zoom scale (for adjusting drag coordinates)
     var zoomScale: CGFloat = 1.0
 
+    // Debug mode: show detected rectangles and OCR lines
+    var debugRects: [KTCRectangleDetector.DetectedRect] = []
+    var debugOCRLines: [KTCRecognizedLine] = []
+
     var body: some View {
         GeometryReader { geo in
             let fittedRect = Self.aspectFitRect(
@@ -58,6 +62,51 @@ struct KTCOverlayView: View {
                                 .position(x: rect.midX, y: rect.midY)
                                 .onTapGesture { onLineSelected?(line) }
                         }
+                    }
+
+                    // Debug: Draw OCR line bounding boxes
+                    if !debugOCRLines.isEmpty {
+                        ForEach(debugOCRLines) { line in
+                            let rect = Self.visionToSwiftUI(
+                                visionBox: line.boundingBox,
+                                fittedRect: fittedRect
+                            )
+                            Rectangle()
+                                .stroke(Color.yellow.opacity(0.5), lineWidth: 0.5)
+                                .frame(width: rect.width, height: rect.height)
+                                .position(x: rect.midX, y: rect.midY)
+                        }
+                    }
+
+                    // Debug: Draw detected rectangles color-coded by type
+                    ForEach(Array(debugRects.enumerated()), id: \.offset) { _, dRect in
+                        let rect = Self.visionToSwiftUI(
+                            visionBox: dRect.boundingBox,
+                            fittedRect: fittedRect
+                        )
+                        let color: Color = switch dRect.type {
+                        case .checkbox: .green
+                        case .textField: .blue
+                        case .signatureLine: .orange
+                        case .unknown: .gray
+                        }
+                        Rectangle()
+                            .stroke(color, lineWidth: 2)
+                            .frame(width: rect.width, height: rect.height)
+                            .position(x: rect.midX, y: rect.midY)
+                        // Type label
+                        let typeLabel: String = {
+                            switch dRect.type {
+                            case .checkbox: return "CB"
+                            case .textField: return "TF"
+                            case .signatureLine: return "SIG"
+                            case .unknown: return "?"
+                            }
+                        }()
+                        Text(typeLabel)
+                            .font(.system(size: 7, weight: .bold))
+                            .foregroundColor(color)
+                            .position(x: rect.midX, y: rect.minY - 4)
                     }
 
                     // Draw field overlays
@@ -421,6 +470,7 @@ struct KTCExpandedImageView: View {
     var checkboxGroups: [KTCCheckboxGroup] = []
     @Binding var showLabelBoxes: Bool
     @ObservedObject var vm: KTCDemo  // Need VM for manual field addition
+    var showDebugOverlay: Bool = false
     @Environment(\.dismiss) private var dismiss
 
     // Zoom state
@@ -518,7 +568,9 @@ struct KTCExpandedImageView: View {
                         onLineSelected: { line in
                             addFieldFromLine(line)
                         },
-                        isEditingPositions: isEditingPositions
+                        isEditingPositions: isEditingPositions,
+                        debugRects: showDebugOverlay ? vm.debugRects : [],
+                        debugOCRLines: showDebugOverlay ? vm.recognizedLines : []
                     )
                 }
                 .clipped()
@@ -670,6 +722,10 @@ struct ZoomableOverlayView: View {
     // Edit positions mode
     var isEditingPositions: Bool = false
 
+    // Debug mode
+    var debugRects: [KTCRectangleDetector.DetectedRect] = []
+    var debugOCRLines: [KTCRecognizedLine] = []
+
     var body: some View {
         KTCOverlayView(
             image: image,
@@ -686,7 +742,9 @@ struct ZoomableOverlayView: View {
             isAddingField: isAddingField,
             onLineSelected: onLineSelected,
             isEditingPositions: isEditingPositions,
-            zoomScale: scale
+            zoomScale: scale,
+            debugRects: debugRects,
+            debugOCRLines: debugOCRLines
         )
         .scaleEffect(scale)
         .offset(offset)

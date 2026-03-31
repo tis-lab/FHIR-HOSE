@@ -131,6 +131,7 @@ final class KTCDemo: ObservableObject {
     @Published var signatureFieldId: UUID? = nil  // Which field to place signature at (if any)
     @Published var signatureSize: CGSize = CGSize(width: 60, height: 24)  // Adjustable signature display size (at 400x600 reference scale)
     @Published var signatureNormalizedPosition: CGPoint? = nil  // Manual position in normalized coords (0-1)
+    @Published var debugRects: [KTCRectangleDetector.DetectedRect] = []  // Raw detected rectangles for debug overlay
 
     /// Sorted keypath list for Picker UI.
     var sortedKeypaths: [String] {
@@ -357,9 +358,30 @@ final class KTCDemo: ObservableObject {
         logger.info("Copied filled data to clipboard (\(text.count) chars)")
     }
 
-    /// Generate a PDF with the scanned image as background and filled values drawn on.
-    /// Returns a temporary file URL for sharing, or nil on failure.
+    /// Generate a PDF — uses PDFKit annotations for v2, legacy rasterized draw for others.
     func generateFilledPDF() -> URL? {
+        if backend == .visionOCRv2 {
+            return generateFilledPDFv2()
+        }
+        return generateFilledPDFLegacy()
+    }
+
+    /// v2: PDFKit annotation-based PDF (vector text, searchable, selectable).
+    private func generateFilledPDFv2() -> URL? {
+        guard let image = pages.first else { return nil }
+        return KTCPDFGenerator.generate(
+            image: image,
+            fields: fields,
+            checkboxGroups: checkboxGroups,
+            signatureImage: hasSignature ? signatureImage : nil,
+            signatureSize: signatureSize,
+            signatureNormalizedPosition: signatureNormalizedPosition,
+            signatureField: signatureField
+        )
+    }
+
+    /// Legacy: Rasterized text drawn on image (used by v1, LayoutLMv3, UDOP).
+    private func generateFilledPDFLegacy() -> URL? {
         guard let image = pages.first else { return nil }
 
         let pageSize = CGSize(width: image.size.width, height: image.size.height)
@@ -622,53 +644,40 @@ final class KTCDemo: ObservableObject {
             guard let self else { return }
             let t0 = CFAbsoluteTimeGetCurrent()
             do {
-                // 1 — Preprocess: CIDocumentEnhancer -> grayscale -> sharpen
-                let enhanced = KTCImagePreprocessor.enhance(cgImage)
+                // 1 — Full preprocess: document segmentation → perspective correction → enhance
+                let enhanced = KTCImagePreprocessor.preprocess(cgImage)
 
                 // 2 — Tuned OCR with medical vocabulary
                 let lines = try await Self.performOCRv2(on: enhanced, pageIndex: 0)
 
-                // 3 — Same heuristic pipeline as v1
+                // 3 — Heuristic field extraction + v2 label cleanup
                 var detectedFields = Self.extractLabelCandidates(from: lines)
-                let checkboxes = Self.detectCheckboxes(from: lines)
-                var checkboxGroups = Self.groupCheckboxes(checkboxes, allLines: lines)
-                Self.classifyFieldTypes(&detectedFields, checkboxes: checkboxes, allLines: lines)
+                Self.cleanupLabels(&detectedFields)
+                let textCheckboxes = Self.detectCheckboxes(from: lines)
+                var checkboxGroups = Self.groupCheckboxes(textCheckboxes, allLines: lines)
+                Self.classifyFieldTypes(&detectedFields, checkboxes: textCheckboxes, allLines: lines)
                 Self.associateValuesWithLabels(&detectedFields, allLines: lines)
 
-                // 4 — Visual checkbox detection on the enhanced image
-                let visualCheckboxes = try Self.detectCheckboxShapes(
-                    in: enhanced, ocrLines: lines,
-                    logger: Logger(subsystem: "com.fhirhose.app", category: "KTC.v2")
+                // 4 — Rectangle detection: find input boxes, checkboxes, signature lines
+                let log = Logger(subsystem: "com.fhirhose.app", category: "KTC.v2")
+                let detectedRects = try KTCRectangleDetector.detect(in: enhanced)
+                let (rectFields, rectCheckboxes) = KTCRectangleDetector.associateWithText(
+                    rects: detectedRects,
+                    ocrLines: lines,
+                    existingFields: detectedFields
                 )
-                // Merge visual checkboxes that don't overlap with text-detected ones
-                let existingBoxes = checkboxes.map(\.boundingBox)
-                for vBox in visualCheckboxes {
-                    let overlaps = existingBoxes.contains { existing in
-                        existing.intersects(vBox)
-                    }
+
+                // Merge rectangle-detected fields into the field list
+                detectedFields.append(contentsOf: rectFields)
+                log.info("[v2] Rectangle detection added \(rectFields.count) fields, \(rectCheckboxes.count) checkboxes")
+
+                // Merge rectangle-detected checkboxes into checkbox groups
+                let existingCBBoxes = textCheckboxes.map(\.boundingBox)
+                for cb in rectCheckboxes {
+                    let overlaps = existingCBBoxes.contains { $0.intersects(cb.boundingBox) }
                     if !overlaps {
-                        let checkbox = KTCCheckbox(
-                            boundingBox: vBox,
-                            isChecked: false,
-                            associatedText: nil
-                        )
-                        // Find nearest text to associate
-                        var nearest: (text: String, dist: CGFloat) = ("", .greatestFiniteMagnitude)
-                        for line in lines {
-                            let dx = line.boundingBox.midX - vBox.midX
-                            let dy = line.boundingBox.midY - vBox.midY
-                            let dist = sqrt(dx * dx + dy * dy)
-                            if dist < nearest.dist && dist < 0.1 {
-                                nearest = (line.text, dist)
-                            }
-                        }
-                        var cb = checkbox
-                        if !nearest.text.isEmpty {
-                            cb.associatedText = nearest.text
-                        }
-                        // Add to a single-checkbox group
                         let group = KTCCheckboxGroup(
-                            boundingBox: vBox,
+                            boundingBox: cb.boundingBox,
                             options: [cb]
                         )
                         checkboxGroups.append(group)
@@ -683,7 +692,6 @@ final class KTCDemo: ObservableObject {
                         field.fieldType != .checkbox && field.fieldType != .signature && field.detectedValue == nil
                     }
                     if !fieldsToQuery.isEmpty {
-                        let log = Logger(subsystem: "com.fhirhose.app", category: "KTC.v2")
                         log.info("[v2] \(fieldsToQuery.count) fields without values — querying AI")
                         let fieldLabels = fieldsToQuery.map { "\($0.offset): \($0.element.label)" }.joined(separator: "\n")
                         let extracted = try await Self.extractFieldsWithAppleIntelligence(
@@ -717,6 +725,7 @@ final class KTCDemo: ObservableObject {
                     self.fields = detectedFields
                     self.checkboxGroups = checkboxGroups
                     self.patientData = data
+                    self.debugRects = detectedRects
                     let withValues = detectedFields.filter { $0.detectedValue != nil }.count
                     let checkboxCount = checkboxGroups.count
                     let autoChecked = checkboxGroups.filter { $0.selectedIndex != nil }.count
@@ -1280,19 +1289,25 @@ final class KTCDemo: ObservableObject {
     ) async throws -> [KTCCheckboxGroup] {
         let session = LanguageModelSession(instructions: """
             You are a form structure analyzer. Given OCR text from a scanned form, identify all \
-            checkbox or radio-button groups that ACTUALLY APPEAR in the text. These are places where \
-            a user must select one or more options from a list. They often look like: \
-            "Label: □ Option1 □ Option2 □ Option3" or "Label: Option1 Option2 Option3" \
-            (the □ symbols may be missing or read as 'o' or 'D').
+            checkbox, radio-button, or circle-one groups that ACTUALLY APPEAR in the text. These are \
+            places where a user must SELECT one option from a SHORT list of predefined choices. \
+            Examples: "Sex: □ Male □ Female", "Marital Status: Single Married Divorced", \
+            "Preferred Method of Travel: Airplane Car Bus Train Other".
 
-            IMPORTANT: Only report groups whose label AND options are explicitly present in the OCR text. \
-            Do NOT invent or guess groups that are not in the text. If the text does not mention \
-            "Marital Status" anywhere, do not include a Marital Status group.
+            CRITICAL RULES:
+            1. Only report groups whose label AND all options are explicitly present in the OCR text.
+            2. Options must be SHORT labels (1-3 words each) that represent predefined choices.
+            3. Do NOT include groups where the "options" are actually separate form field labels \
+               that each have their own fill-in blank or underline. For example, if the form has \
+               "Initial Travel Date: ___" and "Length of Stay: ___" on separate lines, those are \
+               NOT checkbox options — they are independent text fields.
+            4. Do NOT invent or guess groups that are not in the text.
+            5. A group must have at least 2 options that are genuinely mutually exclusive choices.
 
             Respond ONLY with lines in this format, one per group:
             GROUP_LABEL|OPTION1,OPTION2,OPTION3
 
-            Do not include any other text or explanations.
+            Do not include any other text or explanations. If there are no checkbox groups, respond with nothing.
             """)
 
         let prompt = """
@@ -2031,6 +2046,34 @@ final class KTCDemo: ObservableObject {
         }
 
         return areas
+    }
+
+    // MARK: - v2 Label Cleanup
+
+    /// Clean up OCR artifacts from detected field labels.
+    /// Strips leading/trailing underscores, dashes, and other scan noise.
+    private nonisolated static func cleanupLabels(_ fields: inout [KTCField]) {
+        for i in fields.indices {
+            var label = fields[i].label
+
+            // Strip leading underscores, dashes, dots, spaces
+            while let first = label.first, "_-. ".contains(first) {
+                label.removeFirst()
+            }
+            // Strip trailing underscores, dashes, colons, dots, spaces
+            while let last = label.last, "_-:. ".contains(last) {
+                label.removeLast()
+            }
+
+            // Collapse multiple spaces
+            while label.contains("  ") {
+                label = label.replacingOccurrences(of: "  ", with: " ")
+            }
+
+            if !label.isEmpty {
+                fields[i].label = label
+            }
+        }
     }
 
     // MARK: - Label Detection Heuristics
@@ -2788,7 +2831,9 @@ enum KTCPatientDataLoader {
           "name last first middle", "print name", "printed name", "name print",
           "name please print", "name of insured", "insured name", "insured s name",
           "name of applicant", "applicant name", "your name", "client name",
-          "individual name", "person name", "name of individual"], "patient.fullName"),
+          "individual name", "person name", "name of individual",
+          "first last name", "first & last name", "first and last name",
+          "first last", "name first last"], "patient.fullName"),
         (["first name", "given name", "first", "forename", "fname",
           "patient first name", "legal first name"], "patient.firstName"),
         (["last name", "surname", "family name", "last", "lname",
@@ -2831,7 +2876,7 @@ enum KTCPatientDataLoader {
         (["address line 2", "address 2", "line 2", "apt", "suite",
           "unit", "apt suite", "apartment", "apt no", "suite no", "unit no",
           "apt number", "suite number", "unit number", "floor",
-          "building", "bldg"], "patient.address.line2"),
+          "building", "bldg", "unit / apt", "unit apt", "unit / apt."], "patient.address.line2"),
         (["city", "city town", "town", "municipality", "city name"], "patient.address.city"),
         (["state", "state province", "st", "province", "state code"], "patient.address.state"),
         (["zip", "zip code", "zipcode", "postal code", "postal",
@@ -2877,9 +2922,29 @@ enum KTCPatientDataLoader {
         let method: String  // "synonym-exact", "synonym-contains", "token", "embedding"
     }
 
+    /// Labels that should never be matched to patient data.
+    /// These are form fields about external entities, not the patient.
+    private static let unmappableLabels: Set<String> = [
+        "name of treating hospital", "treating hospital", "hospital name",
+        "hospital", "facility name", "facility", "clinic name", "clinic",
+        "physician name", "doctor name", "provider name", "referring physician",
+        "referring doctor", "attending physician", "primary care physician",
+        "name of physician", "name of doctor", "name of provider",
+        "length of stay", "preferred method of travel", "additional travel needs",
+        "travel details", "travel needs", "method of travel",
+        "reason for visit", "chief complaint", "diagnosis",
+        "employer name", "employer", "company name", "company",
+        "pharmacy name", "pharmacy",
+    ]
+
     /// Try to match a label string to a keypath with confidence scoring.
     static func fuzzyMatch(label: String, in data: [String: String]) -> MatchResult? {
         let normalized = normalize(label)
+
+        // Blocklist check: skip labels that shouldn't map to patient data
+        if unmappableLabels.contains(normalized) {
+            return nil
+        }
 
         // 1. Exact synonym match (confidence: 1.0)
         for entry in synonyms {
