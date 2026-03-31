@@ -19,6 +19,7 @@ enum FormAutofillBackend: String, CaseIterable, Identifiable {
     case visionOCR = "visionOCR"
     case layoutlmv3 = "layoutlmv3"
     case udop = "udop"
+    case visionOCRv2 = "visionOCRv2"
 
     var id: String { rawValue }
 
@@ -27,6 +28,7 @@ enum FormAutofillBackend: String, CaseIterable, Identifiable {
         case .visionOCR: return "Vision OCR"
         case .layoutlmv3: return "LayoutLMv3"
         case .udop: return "UDOP"
+        case .visionOCRv2: return "Vision OCR v2"
         }
     }
 
@@ -569,6 +571,8 @@ final class KTCDemo: ObservableObject {
             runLayoutLMv3Pipeline(cgImage: cgImage)
         case .udop:
             runUDOPPipeline(cgImage: cgImage)
+        case .visionOCRv2:
+            runVisionOCRv2Pipeline(cgImage: cgImage)
         }
     }
 
@@ -607,6 +611,169 @@ final class KTCDemo: ObservableObject {
                     UINotificationFeedbackGenerator().notificationOccurred(.error)
                     self.phase = .error("OCR failed: \(error.localizedDescription)")
                 }
+            }
+        }
+    }
+
+    // MARK: - Vision OCR v2 Pipeline (enhanced preprocessing + tuned OCR)
+
+    private func runVisionOCRv2Pipeline(cgImage: CGImage) {
+        Task.detached(priority: .userInitiated) { [weak self] in
+            guard let self else { return }
+            let t0 = CFAbsoluteTimeGetCurrent()
+            do {
+                // 1 — Preprocess: CIDocumentEnhancer -> grayscale -> sharpen
+                let enhanced = KTCImagePreprocessor.enhance(cgImage)
+
+                // 2 — Tuned OCR with medical vocabulary
+                let lines = try await Self.performOCRv2(on: enhanced, pageIndex: 0)
+
+                // 3 — Same heuristic pipeline as v1
+                var detectedFields = Self.extractLabelCandidates(from: lines)
+                let checkboxes = Self.detectCheckboxes(from: lines)
+                var checkboxGroups = Self.groupCheckboxes(checkboxes, allLines: lines)
+                Self.classifyFieldTypes(&detectedFields, checkboxes: checkboxes, allLines: lines)
+                Self.associateValuesWithLabels(&detectedFields, allLines: lines)
+
+                // 4 — Visual checkbox detection on the enhanced image
+                let visualCheckboxes = try Self.detectCheckboxShapes(
+                    in: enhanced, ocrLines: lines,
+                    logger: Logger(subsystem: "com.fhirhose.app", category: "KTC.v2")
+                )
+                // Merge visual checkboxes that don't overlap with text-detected ones
+                let existingBoxes = checkboxes.map(\.boundingBox)
+                for vBox in visualCheckboxes {
+                    let overlaps = existingBoxes.contains { existing in
+                        existing.intersects(vBox)
+                    }
+                    if !overlaps {
+                        let checkbox = KTCCheckbox(
+                            boundingBox: vBox,
+                            isChecked: false,
+                            associatedText: nil
+                        )
+                        // Find nearest text to associate
+                        var nearest: (text: String, dist: CGFloat) = ("", .greatestFiniteMagnitude)
+                        for line in lines {
+                            let dx = line.boundingBox.midX - vBox.midX
+                            let dy = line.boundingBox.midY - vBox.midY
+                            let dist = sqrt(dx * dx + dy * dy)
+                            if dist < nearest.dist && dist < 0.1 {
+                                nearest = (line.text, dist)
+                            }
+                        }
+                        var cb = checkbox
+                        if !nearest.text.isEmpty {
+                            cb.associatedText = nearest.text
+                        }
+                        // Add to a single-checkbox group
+                        let group = KTCCheckboxGroup(
+                            boundingBox: vBox,
+                            options: [cb]
+                        )
+                        checkboxGroups.append(group)
+                    }
+                }
+
+                // 5 — Apple Intelligence for field values + checkbox groups (iOS 26+)
+                if #available(iOS 26, *) {
+                    let fullOCRText = lines.map(\.text).joined(separator: "\n")
+
+                    let fieldsToQuery = detectedFields.enumerated().filter { (_, field) in
+                        field.fieldType != .checkbox && field.fieldType != .signature && field.detectedValue == nil
+                    }
+                    if !fieldsToQuery.isEmpty {
+                        let log = Logger(subsystem: "com.fhirhose.app", category: "KTC.v2")
+                        log.info("[v2] \(fieldsToQuery.count) fields without values — querying AI")
+                        let fieldLabels = fieldsToQuery.map { "\($0.offset): \($0.element.label)" }.joined(separator: "\n")
+                        let extracted = try await Self.extractFieldsWithAppleIntelligence(
+                            ocrText: fullOCRText, fieldLabels: fieldLabels, logger: log
+                        )
+                        for (idx, value) in extracted {
+                            if idx < detectedFields.count {
+                                detectedFields[idx].detectedValue = value
+                                detectedFields[idx].value = value
+                            }
+                        }
+                    }
+
+                    let aiCheckboxGroups = try await Self.detectCheckboxGroupsWithAI(
+                        ocrText: lines.map(\.text).joined(separator: "\n"),
+                        logger: Logger(subsystem: "com.fhirhose.app", category: "KTC.v2")
+                    )
+                    if !aiCheckboxGroups.isEmpty {
+                        checkboxGroups.append(contentsOf: aiCheckboxGroups)
+                    }
+                }
+
+                // 6 — Patient data mapping
+                let data = KTCPatientDataLoader.loadAndFlatten()
+                KTCPatientDataLoader.applyMappings(to: &detectedFields, using: data)
+                Self.autoCheckCheckboxGroups(&checkboxGroups, using: data)
+
+                let elapsed = String(format: "%.1f", CFAbsoluteTimeGetCurrent() - t0)
+                await MainActor.run {
+                    self.recognizedLines = lines
+                    self.fields = detectedFields
+                    self.checkboxGroups = checkboxGroups
+                    self.patientData = data
+                    let withValues = detectedFields.filter { $0.detectedValue != nil }.count
+                    let checkboxCount = checkboxGroups.count
+                    let autoChecked = checkboxGroups.filter { $0.selectedIndex != nil }.count
+                    self.logger.info("[VisionOCR-v2] Complete in \(elapsed)s: \(lines.count) lines, \(detectedFields.count) fields (\(withValues) with values), \(checkboxCount) groups (\(autoChecked) auto-checked)")
+                    UINotificationFeedbackGenerator().notificationOccurred(.success)
+                    self.phase = .editing
+                }
+            } catch {
+                await MainActor.run {
+                    self.logger.error("[VisionOCR-v2] Failed: \(error.localizedDescription)")
+                    UINotificationFeedbackGenerator().notificationOccurred(.error)
+                    self.phase = .error("Vision OCR v2 failed: \(error.localizedDescription)")
+                }
+            }
+        }
+    }
+
+    /// Tuned OCR for Vision OCR v2 — medical vocabulary, lower text height threshold.
+    private nonisolated static func performOCRv2(on cgImage: CGImage, pageIndex: Int) async throws -> [KTCRecognizedLine] {
+        try await withCheckedThrowingContinuation { continuation in
+            let request = VNRecognizeTextRequest { request, error in
+                if let error {
+                    continuation.resume(throwing: error)
+                    return
+                }
+                guard let observations = request.results as? [VNRecognizedTextObservation] else {
+                    continuation.resume(returning: [])
+                    return
+                }
+
+                let lines: [KTCRecognizedLine] = observations.compactMap { obs in
+                    guard let candidate = obs.topCandidates(1).first else { return nil }
+                    return KTCRecognizedLine(
+                        text: candidate.string,
+                        boundingBox: obs.boundingBox,
+                        confidence: candidate.confidence,
+                        pageIndex: pageIndex
+                    )
+                }
+                continuation.resume(returning: lines)
+            }
+
+            request.recognitionLevel = .accurate
+            request.usesLanguageCorrection = true
+            request.recognitionLanguages = ["en-US"]
+            request.automaticallyDetectsLanguage = false
+            request.minimumTextHeight = 0.008
+            request.customWords = KTCMedicalVocabulary.customWords
+            if #available(iOS 16.0, *) {
+                request.revision = VNRecognizeTextRequestRevision3
+            }
+
+            let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+            do {
+                try handler.perform([request])
+            } catch {
+                continuation.resume(throwing: error)
             }
         }
     }
