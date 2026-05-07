@@ -2,9 +2,9 @@ name: Validate BDF Metadata
 
 on:
   push:
-    branches: [ EC_20250927, 9mo_milestone, main ]
+    branches: [ main ]
   pull_request:
-    branches: [ EC_20250927, 9mo_milestone, main ]
+    branches: [ main ]
 
 jobs:
   validate-tool:
