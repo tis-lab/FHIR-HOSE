@@ -2,24 +2,15 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>NSAppTransportSecurity</key>
-    <dict>
-        <key>NSAllowsArbitraryLoads</key>
-        <true/>
-    </dict>
-
-    <key>NSDocumentsFolderUsageDescription</key>
-    <string>We need access to store your health records.</string>
-
-    <key>NSPhotoLibraryUsageDescription</key>
-    <string>We need access to upload medical images.</string>
-
-    <key>NSHealthShareUsageDescription</key>
-    <string>We need access to upload medical records.</string>
-
-    <key>CFBundleURLTypes</key>
-    <array>
-        <dict/>
-    </array>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict/>
+	</array>
+	<key>UISupportedInterfaceOrientations</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+		<string>UIInterfaceOrientationLandscapeLeft</string>
+		<string>UIInterfaceOrientationLandscapeRight</string>
+	</array>
 </dict>
 </plist>

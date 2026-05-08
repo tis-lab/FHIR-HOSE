@@ -1,0 +1,22 @@
+{
+  "patient": {
+    "firstName": "Ada",
+    "lastName": "Lovelace",
+    "dateOfBirth": "1815-12-10",
+    "sex": "F",
+    "phone": "555-123-4567",
+    "email": "ada@example.com",
+    "address": {
+      "line1": "123 Main St",
+      "line2": "Apt 4",
+      "city": "San Francisco",
+      "state": "CA",
+      "postalCode": "94105"
+    },
+    "insurance": {
+      "memberId": "ABC123",
+      "groupId": "G-999",
+      "payer": "Demo Health Plan"
+    }
+  }
+}

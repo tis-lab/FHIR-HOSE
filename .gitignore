@@ -1,0 +1,24 @@
+# Xcode
+xcuserdata/
+build/
+DerivedData/
+
+# macOS
+.DS_Store
+
+# Logs
+logs/
+*.log
+
+# Secrets
+*secrets*
+*apikey*
+*.env
+
+# Model
+*.gguf
+*.mlpackage
+*.model
+
+# Local docs (not published in public repo)
+FHIR-HOSE/Docs/

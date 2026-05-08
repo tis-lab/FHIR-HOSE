@@ -1,0 +1,4 @@
+{
+  "serverBase": "https://matt.might.net",
+  "baseUrlPrefix": "/charm/api/charmonizer/v1"
+}

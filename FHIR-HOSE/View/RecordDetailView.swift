@@ -9,21 +9,16 @@ import SwiftUI
 
 struct RecordDetailView: View {
     let record: HealthRecord
-    
+
     var body: some View {
         VStack {
-            // This is a placeholder for the actual record view
-            // In the future, this will show processed FHIR data
-            Group {
-                if record.processed {
-                    ProcessedRecordView(record: record)
-                } else {
-                    UnprocessedRecordView()
-                }
+            // Show either processed or unprocessed UI
+            if record.processed {
+                ProcessedRecordView(record: record)
+            } else {
+                UnprocessedRecordView()
             }
         }
         .navigationTitle(record.filename)
     }
 }
-
-

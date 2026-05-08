@@ -1,0 +1,75 @@
+version: 1.0.0
+
+tool:
+  name: FHIR-HOSE
+  repo_url: https://github.com/ehurwitz/FHIR-HOSE
+  tool_homepage: https://github.com/ehurwitz/FHIR-HOSE
+  documentation_url: https://github.com/ehurwitz/FHIR-HOSE
+  tool_type: WebApp
+  tool_notes: Mobile app
+
+llm:
+  usesLlm: true
+  modelsSupported:
+    - openai
+    - anthropic
+    - ollama
+  modelsRequired:
+    - openai
+  bringOwnKey: true
+
+input:
+  - name: clinical/phenotype structured 1
+    dataCategory: clinical-phenotype
+    dataClass: structured
+    dataType: clinical-ehr
+    format:
+      - pdf
+    dataStandard:
+      - FHIR
+    proprietary: false
+
+output:
+  - name: clinical/phenotype structured 1
+    dataCategory: clinical-phenotype
+    dataClass: structured
+    dataType: clinical-ehr
+    format:
+      - json
+    dataStandard:
+      - FHIR
+    proprietary: false
+
+license:
+  license_type: MIT
+  link: https://github.com/CHARM-BDF/CHARM-README/blob/main/license.txt
+
+funding:
+  source: ARPA-H
+  agreement: Not specified
+  link: https://arpa-h.gov/
+
+domains:
+  - healthcare/clinical
+
+credit:
+  - name: UAB Team
+    role: Developer
+    org: University of Alabama at Birmingham
+    url: https://www.uab.edu/medicine/pmi/
+
+target_users:
+  primary_user:
+    user_type: patient
+    technical_literacy_level:
+      - novice
+    biomedical_literacy_level:
+      - novice
+
+maturity:
+  beginning_maturity: 1
+  current_maturity: 3
+
+media: []
+
+collaborations: []

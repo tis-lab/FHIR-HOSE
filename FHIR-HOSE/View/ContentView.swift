@@ -8,6 +8,8 @@
 import SwiftUI
 import UniformTypeIdentifiers
 
+private let fileLogger = FileLogger.shared
+
 
 struct ContentView: View {
     @StateObject private var recordStore = HealthRecordStore()
@@ -20,20 +22,18 @@ struct ContentView: View {
     var body: some View {
         TabView(selection: $selectedTab) {
             
+            // Home Tab
+            NavigationView {
+                HomeView()
+                    .environmentObject(recordStore)
+            }
+            .tabItem {
+                Label("Home", systemImage: "house")
+            }
+            .tag(0)
+            
             // Records Tab
             NavigationView {
-                
-                // TODO: REMOVE THIS - right now this blocks some function but is here to show healthkit capability
-              //  Button(action: fetchHealthData) {
-                //                Text("Fetch Now")
-                  //                  .font(.headline)
-                    //                .padding()
-                      //              .frame(maxWidth: .infinity)
-                        //            .background(Color.green)
-                          //          .foregroundColor(.white)
-                            //        .cornerRadius(10)
-                            //}
-                
                 RecordsListView(recordStore: recordStore)
                     .navigationTitle("Health Records")
                     .toolbar {
@@ -54,7 +54,16 @@ struct ContentView: View {
             .tabItem {
                 Label("Records", systemImage: "list.bullet")
             }
-            .tag(0)
+            .tag(1)
+            
+            // Clinical Trial Matcher Tab
+            NavigationView {
+                ClinicalTrialView(recordStore: recordStore)
+            }
+            .tabItem {
+                Label("Trial Matcher", systemImage: "stethoscope")
+            }
+            .tag(2)
             
             // Settings Tab
             NavigationView {
@@ -64,13 +73,16 @@ struct ContentView: View {
             .tabItem {
                 Label("Settings", systemImage: "gear")
             }
-            .tag(1)
+            .tag(3)
         }
         .sheet(isPresented: $showingDocumentPicker) {
             DocumentPicker(recordStore: recordStore)
         }
         .sheet(isPresented: $showingImagePicker) {
             ImagePicker(recordStore: recordStore)
+        }
+        .onAppear {
+            recordStore.loadHealthKitRecords()
         }
     }
     
@@ -84,17 +96,17 @@ struct ContentView: View {
                                 User's Name: \(result.name ?? "Unknown")
                                 User's Birthday: \(birthday)
                                 """
-                                print(healthDataMessage)
+                                fileLogger.info(healthDataMessage, category: "UI-HealthKit")
                             } else {
                                 healthDataMessage = "Could not retrieve birthday."
-                                print(healthDataMessage)
+                                fileLogger.warning(healthDataMessage, category: "UI-HealthKit")
                             }
                         }
                     }
                 } else {
                     DispatchQueue.main.async {
                         healthDataMessage = "HealthKit authorization failed: \(error?.localizedDescription ?? "Unknown error")"
-                        print(healthDataMessage)
+                        fileLogger.error(healthDataMessage, category: "UI-HealthKit")
                     }
                 }
             }
