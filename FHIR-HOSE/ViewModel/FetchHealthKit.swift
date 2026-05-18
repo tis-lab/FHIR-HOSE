@@ -10,6 +10,24 @@ import Foundation
 
 private let fileLogger = FileLogger.shared
 
+/// Maps an `HKFHIRVersion` to a release code used for bucketing exports.
+///
+/// FHIR release lineage: DSTU1 (0.x), DSTU2 (1.0.x), STU3 (3.0.x), R4 (4.0.x),
+/// R4B (4.3.x), R5 (5.0.x). R4 and R4B share major version 4 and are distinguished
+/// by minor version. Versions not on this lineage fall through to `"unknown"`.
+private func fhirReleaseCode(for version: HKFHIRVersion?) -> String {
+    guard let v = version else { return "unknown" }
+    switch (v.majorVersion, v.minorVersion) {
+    case (0, _): return "dstu1"
+    case (1, _): return "dstu2"
+    case (3, _): return "stu3"
+    case (4, 0): return "r4"
+    case (4, 3): return "r4b"
+    case (5, _): return "r5"
+    default: return "unknown"
+    }
+}
+
 extension HKBloodType {
     var displayString: String {
         switch self {
@@ -350,7 +368,9 @@ class HealthKitManager: ObservableObject {
                         "displayName": sample.clinicalType.identifier,
                         "startDate": sample.startDate,
                         "endDate": sample.endDate,
-                        "fhirResource": sample.fhirResource?.data.base64EncodedString() ?? ""
+                        "fhirResource": sample.fhirResource?.data.base64EncodedString() ?? "",
+                        "fhirVersion": sample.fhirResource?.fhirVersion.stringRepresentation ?? "unknown",
+                        "fhirRelease": fhirReleaseCode(for: sample.fhirResource?.fhirVersion)
                     ]
                     
                     // Debug: Check if this clinical record contains Patient data
@@ -460,7 +480,9 @@ class HealthKitManager: ObservableObject {
                                     "startDate": sample.startDate,
                                     "endDate": sample.endDate,
                                     "sourceType": identifier.rawValue,
-                                    "fhirResource": try! JSONSerialization.data(withJSONObject: resource).base64EncodedString()
+                                    "fhirResource": try! JSONSerialization.data(withJSONObject: resource).base64EncodedString(),
+                                    "fhirVersion": fhirResource.fhirVersion.stringRepresentation,
+                                    "fhirRelease": fhirReleaseCode(for: fhirResource.fhirVersion)
                                 ]
                                 
                                 let patientRecord = HealthRecord(healthKitType: "PatientFHIRResource", data: patientData, date: sample.startDate)
@@ -480,7 +502,9 @@ class HealthKitManager: ObservableObject {
                             "startDate": sample.startDate,
                             "endDate": sample.endDate,
                             "sourceType": identifier.rawValue,
-                            "fhirResource": fhirResource.data.base64EncodedString()
+                            "fhirResource": fhirResource.data.base64EncodedString(),
+                            "fhirVersion": fhirResource.fhirVersion.stringRepresentation,
+                            "fhirRelease": fhirReleaseCode(for: fhirResource.fhirVersion)
                         ]
                         
                         let patientRecord = HealthRecord(healthKitType: "PatientFHIRResource", data: patientData, date: sample.startDate)
