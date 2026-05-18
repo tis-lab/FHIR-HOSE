@@ -17,16 +17,6 @@ struct HomeView: View {
                 GridItem(.flexible())
             ], spacing: 20) {
                 
-                NavigationLink(destination: ClinicalTrialView(recordStore: recordStore)) {
-                    HealthAppCard(
-                        title: "Clinical Trial Matcher",
-                        subtitle: "Find relevant clinical trials",
-                        systemImage: "stethoscope",
-                        color: .blue
-                    )
-                }
-                .buttonStyle(PlainButtonStyle())
-                
                 NavigationLink(destination: ChatWithRecordsView(recordStore: recordStore)) {
                     HealthAppCard(
                         title: "Chat with My Records",
@@ -36,37 +26,7 @@ struct HomeView: View {
                     )
                 }
                 .buttonStyle(PlainButtonStyle())
-                
-                NavigationLink(destination: OutliveChecklistView(records: recordStore.records)) {
-                    HealthAppCard(
-                        title: "Outlive Checklist",
-                        subtitle: "Longevity assessment",
-                        systemImage: "heart.text.square",
-                        color: .purple
-                    )
-                }
-                .buttonStyle(PlainButtonStyle())
-                
-                NavigationLink(destination: UndiagnosedDiseasesView(records: recordStore.records)) {
-                    HealthAppCard(
-                        title: "Undiagnosed Diseases Network",
-                        subtitle: "UDN application assistant",
-                        systemImage: "cross.case",
-                        color: .indigo
-                    )
-                }
-                .buttonStyle(PlainButtonStyle())
-                
-                NavigationLink(destination: CBTAlcoholCoachView(records: recordStore.records)) {
-                    HealthAppCard(
-                        title: "CBT Recovery Coach",
-                        subtitle: "Alcohol recovery support",
-                        systemImage: "brain.head.profile",
-                        color: .mint
-                    )
-                }
-                .buttonStyle(PlainButtonStyle())
-                
+
                 NavigationLink(destination: COPDView(records: recordStore.records)) {
                     HealthAppCard(
                         title: "COPD Prediction",

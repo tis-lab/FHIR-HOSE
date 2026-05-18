@@ -56,15 +56,6 @@ struct ContentView: View {
             }
             .tag(1)
             
-            // Clinical Trial Matcher Tab
-            NavigationView {
-                ClinicalTrialView(recordStore: recordStore)
-            }
-            .tabItem {
-                Label("Trial Matcher", systemImage: "stethoscope")
-            }
-            .tag(2)
-            
             // Settings Tab
             NavigationView {
                 SettingsView()
@@ -73,7 +64,7 @@ struct ContentView: View {
             .tabItem {
                 Label("Settings", systemImage: "gear")
             }
-            .tag(3)
+            .tag(2)
         }
         .sheet(isPresented: $showingDocumentPicker) {
             DocumentPicker(recordStore: recordStore)
