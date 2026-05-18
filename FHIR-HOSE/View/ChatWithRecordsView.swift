@@ -11,7 +11,7 @@ import OSLog
 
 struct ChatWithRecordsView: View {
     @ObservedObject var recordStore: HealthRecordStore
-    @StateObject private var clinicalTrialMatcher = ClinicalTrialMatcher()
+    @StateObject private var chatService = ChatRecordsService()
     @State private var showingWebView = false
     @State private var webViewURL: URL?
     @State private var isLoading = false
@@ -227,7 +227,7 @@ struct ChatWithRecordsView: View {
     
     private func generateMedicalText() {
         logger.info("Generating medical text from \(recordStore.records.count) records")
-        generatedMedicalText = clinicalTrialMatcher.convertRecordsToMedicalText(recordStore.records)
+        generatedMedicalText = chatService.convertRecordsToMedicalText(recordStore.records)
     }
     
     private func startChatWithRecords() {
@@ -260,13 +260,13 @@ struct ChatWithRecordsView: View {
             )
             
             // Create session with chat service
-            let sessionResponse = try await clinicalTrialMatcher.createChatSession(
+            let sessionResponse = try await chatService.createChatSession(
                 medicalRecord: generatedMedicalText,
                 chatContext: chatContext
             )
-            
+
             // Generate URL for the chat interface
-            if let url = clinicalTrialMatcher.generateChatURL(sessionId: sessionResponse.sessionId) {
+            if let url = chatService.generateChatURL(sessionId: sessionResponse.sessionId) {
                 logger.info("Opening chat interface at: \(url.absoluteString)")
                 webViewURL = url
                 showingWebView = true
@@ -315,6 +315,39 @@ struct ChatWebView: UIViewRepresentable {
         
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
             print("ChatWebView finished loading")
+        }
+    }
+}
+
+// MARK: - Medical Text View
+
+struct MedicalTextView: View {
+    let text: String
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationView {
+            ScrollView {
+                Text(text)
+                    .font(.system(.body, design: .monospaced))
+                    .padding()
+            }
+            .navigationTitle("Medical Summary")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Done") {
+                        dismiss()
+                    }
+                }
+                ToolbarItem(placement: .primaryAction) {
+                    Button(action: {
+                        UIPasteboard.general.string = text
+                    }) {
+                        Image(systemName: "doc.on.doc")
+                    }
+                }
+            }
         }
     }
 }
