@@ -6,6 +6,7 @@
 //
 
 import SwiftUI
+import UniformTypeIdentifiers
 #if os(iOS) || os(visionOS)
 import UIKit
 #elseif os(macOS)
@@ -15,15 +16,6 @@ import AppKit
 struct RecordsListView: View {
     @ObservedObject var recordStore: HealthRecordStore
     @State private var searchText = ""
-
-    @State private var exportURL: URL?
-    @State private var exportErrorMessage: String?
-    @State private var copyConfirmation: String?
-    @State private var isExporting = false
-    @State private var bannerDismissTask: Task<Void, Never>?
-
-    private static let bannerVisibleDuration: Duration = .seconds(2.5)
-    private static let bannerFadeDuration: Double = 0.35
 
     var body: some View {
         Group {
@@ -61,47 +53,66 @@ struct RecordsListView: View {
                 }
             }
         }
-        .toolbar {
-            ToolbarItem(placement: .topBarLeading) {
-                Menu {
-                    Button(action: copyBundleToClipboard) {
-                        Label("Copy FHIR Bundle to Clipboard", systemImage: "doc.on.doc")
-                    }
-                    Button(action: exportBundleToFile) {
-                        Label("Save FHIR Bundle to File…", systemImage: "square.and.arrow.down")
-                    }
-                    if let url = exportURL {
-                        ShareLink(item: url) {
-                            Label("Share \(url.lastPathComponent)", systemImage: "square.and.arrow.up")
-                        }
-                    }
-                } label: {
-                    if isExporting {
-                        ProgressView()
-                    } else {
-                        Image(systemName: "square.and.arrow.up")
-                    }
-                }
-                .disabled(isExporting || recordStore.records.isEmpty)
+        .safeAreaInset(edge: .bottom) {
+            if !recordStore.records.isEmpty {
+                bottomActionBar
             }
         }
-        .overlay(alignment: .bottom) {
-            VStack(spacing: 4) {
-                if let copyConfirmation {
-                    bannerText(copyConfirmation, color: .green)
-                        .transition(.opacity.combined(with: .move(edge: .bottom)))
-                }
-                if let exportErrorMessage {
-                    bannerText(exportErrorMessage, color: .red)
-                        .transition(.opacity.combined(with: .move(edge: .bottom)))
-                }
-                if !recordStore.records.isEmpty {
-                    recordCountView
-                }
+    }
+
+    private var bottomActionBar: some View {
+        shareControl
+            .padding(.horizontal, 16)
+            .padding(.bottom, 4)
+    }
+
+    @ViewBuilder
+    private var shareControl: some View {
+        let exports = FHIRBundleExporter.makeExports(from: recordStore.records)
+
+        if exports.count == 1 {
+            // Single release: skip the menu — one tap goes straight to the share sheet.
+            ShareLink(
+                item: BundleFile(export: exports[0]),
+                preview: SharePreview("\(exports[0].displayName) FHIR Bundle")
+            ) {
+                shareButtonLabel("Export Health Data")
             }
-            .animation(.easeOut(duration: Self.bannerFadeDuration), value: copyConfirmation)
-            .animation(.easeOut(duration: Self.bannerFadeDuration), value: exportErrorMessage)
+            .buttonStyle(.borderedProminent)
+            .controlSize(.large)
+        } else if exports.count > 1 {
+            Menu {
+                ForEach(exports, id: \.release) { export in
+                    ShareLink(
+                        item: BundleFile(export: export),
+                        preview: SharePreview("\(export.displayName) FHIR Bundle")
+                    ) {
+                        Label(
+                            "\(export.displayName) (\(export.entryCount) records)",
+                            systemImage: "doc.text"
+                        )
+                    }
+                }
+                Divider()
+                ShareLink(
+                    item: BundlesZipFile(exports: exports),
+                    preview: SharePreview("FHIR Bundles ZIP")
+                ) {
+                    Label("All as ZIP", systemImage: "doc.zipper")
+                }
+            } label: {
+                shareButtonLabel("Export Health Data")
+            }
+            .menuStyle(.button)
+            .buttonStyle(.borderedProminent)
+            .controlSize(.large)
         }
+    }
+
+    private func shareButtonLabel(_ title: String) -> some View {
+        Label(title, systemImage: "square.and.arrow.up")
+            .fontWeight(.semibold)
+            .frame(maxWidth: .infinity)
     }
 
     private var filteredRecords: [HealthRecord] {
@@ -115,106 +126,47 @@ struct RecordsListView: View {
             }
         }
     }
+}
 
-    private var recordCountView: some View {
-        Text("\(filteredRecords.count) records")
-            .font(.caption)
-            .foregroundColor(.secondary)
-            .padding(.horizontal, 12)
-            .padding(.vertical, 6)
-            .background(Color(UIColor.systemBackground).opacity(0.8))
-            .cornerRadius(8)
-            .padding(.bottom, 8)
+// MARK: - Transferable share items
+
+/// A single FHIR Bundle file produced on-demand for `ShareLink`. The JSON is only
+/// serialized and written to `tmp/` when the share sheet actually requests it.
+private struct BundleFile: Transferable {
+    let export: FHIRBundleExporter.Export
+
+    static var transferRepresentation: some TransferRepresentation {
+        FileRepresentation(exportedContentType: .json) { file in
+            let data = try file.export.data()
+            let timestamp = ISO8601DateFormatter().string(from: Date())
+                .replacingOccurrences(of: ":", with: "-")
+            let url = FileManager.default.temporaryDirectory
+                .appendingPathComponent("fhir-bundle-\(file.export.release)-\(timestamp).json")
+            try data.write(to: url, options: .atomic)
+            return SentTransferredFile(url)
+        }
     }
+}
 
-    private func bannerText(_ text: String, color: Color) -> some View {
-        Text(text)
-            .font(.caption)
-            .foregroundColor(.white)
-            .padding(.horizontal, 12)
-            .padding(.vertical, 6)
-            .background(color.opacity(0.9))
-            .cornerRadius(8)
-    }
+/// A zip of one-or-more FHIR Bundles, generated on-demand for `ShareLink`.
+private struct BundlesZipFile: Transferable {
+    let exports: [FHIRBundleExporter.Export]
 
-    private func copyBundleToClipboard() {
-        clearBanners()
-        do {
-            let data = try FHIRBundleExporter.makeCollectionBundleData(from: recordStore.records)
-            guard let json = String(data: data, encoding: .utf8) else {
-                showError("Could not encode bundle as UTF-8.")
-                return
+    static var transferRepresentation: some TransferRepresentation {
+        FileRepresentation(exportedContentType: .zip) { file in
+            let timestamp = ISO8601DateFormatter().string(from: Date())
+                .replacingOccurrences(of: ":", with: "-")
+            let entries: [ZipEncoder.File] = try file.exports.map { export in
+                ZipEncoder.File(
+                    name: "fhir-bundle-\(export.release)-\(timestamp).json",
+                    data: try export.data()
+                )
             }
-            writeStringToClipboard(json)
-            let kb = Double(data.count) / 1024.0
-            showBanner(success: String(format: "Copied %.1f KB FHIR Bundle to clipboard.", kb))
-        } catch {
-            showError("Copy failed: \(error.localizedDescription)")
+            let archive = ZipEncoder.makeArchive(files: entries)
+            let url = FileManager.default.temporaryDirectory
+                .appendingPathComponent("fhir-bundles-\(timestamp).zip")
+            try archive.write(to: url, options: .atomic)
+            return SentTransferredFile(url)
         }
-    }
-
-    private func exportBundleToFile() {
-        isExporting = true
-        clearBanners()
-        let records = recordStore.records
-
-        Task.detached(priority: .userInitiated) {
-            do {
-                let data = try FHIRBundleExporter.makeCollectionBundleData(from: records)
-                let timestamp = ISO8601DateFormatter().string(from: Date())
-                    .replacingOccurrences(of: ":", with: "-")
-                let url = FileManager.default.temporaryDirectory
-                    .appendingPathComponent("fhir-bundle-\(timestamp).json")
-                try data.write(to: url, options: .atomic)
-
-                await MainActor.run {
-                    exportURL = url
-                    isExporting = false
-                }
-            } catch {
-                await MainActor.run {
-                    isExporting = false
-                    showError("Export failed: \(error.localizedDescription)")
-                }
-            }
-        }
-    }
-
-    private func clearBanners() {
-        bannerDismissTask?.cancel()
-        bannerDismissTask = nil
-        copyConfirmation = nil
-        exportErrorMessage = nil
-    }
-
-    private func showBanner(success: String) {
-        copyConfirmation = success
-        exportErrorMessage = nil
-        scheduleBannerDismiss()
-    }
-
-    private func showError(_ message: String) {
-        exportErrorMessage = message
-        copyConfirmation = nil
-        scheduleBannerDismiss()
-    }
-
-    private func scheduleBannerDismiss() {
-        bannerDismissTask?.cancel()
-        bannerDismissTask = Task { @MainActor in
-            try? await Task.sleep(for: Self.bannerVisibleDuration)
-            guard !Task.isCancelled else { return }
-            copyConfirmation = nil
-            exportErrorMessage = nil
-        }
-    }
-
-    private func writeStringToClipboard(_ string: String) {
-        #if os(iOS) || os(visionOS)
-        UIPasteboard.general.string = string
-        #elseif os(macOS)
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(string, forType: .string)
-        #endif
     }
 }
