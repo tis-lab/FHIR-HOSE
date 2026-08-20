@@ -6,9 +6,6 @@
 //
 
 import SwiftUI
-import UniformTypeIdentifiers
-
-private let fileLogger = FileLogger.shared
 
 
 struct ContentView: View {
@@ -16,8 +13,6 @@ struct ContentView: View {
     @State private var showingDocumentPicker = false
     @State private var showingImagePicker = false
     @State private var selectedTab = 0
-    @State private var healthDataMessage = "Press the button to fetch HealthKit data."
-        private let healthKitManager = HealthKitManager()
     
     var body: some View {
         TabView(selection: $selectedTab) {
@@ -76,33 +71,4 @@ struct ContentView: View {
             recordStore.loadHealthKitRecords()
         }
     }
-    
-    private func fetchHealthData() {
-            healthKitManager.requestAuthorization { success, error in
-                if success {
-                    if let result = healthKitManager.fetchNameAndBirthday() {
-                        DispatchQueue.main.async {
-                            if let birthday = result.birthday {
-                                healthDataMessage = """
-                                User's Name: \(result.name ?? "Unknown")
-                                User's Birthday: \(birthday)
-                                """
-                                fileLogger.info(healthDataMessage, category: "UI-HealthKit")
-                            } else {
-                                healthDataMessage = "Could not retrieve birthday."
-                                fileLogger.warning(healthDataMessage, category: "UI-HealthKit")
-                            }
-                        }
-                    }
-                } else {
-                    DispatchQueue.main.async {
-                        healthDataMessage = "HealthKit authorization failed: \(error?.localizedDescription ?? "Unknown error")"
-                        fileLogger.error(healthDataMessage, category: "UI-HealthKit")
-                    }
-                }
-            }
-        }
 }
-
-
-
