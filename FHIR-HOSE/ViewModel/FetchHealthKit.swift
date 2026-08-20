@@ -474,13 +474,18 @@ class HealthKitManager: ObservableObject {
                                entryResourceType == "Patient" {
                                 
                                 // Found a Patient resource! Create a record for it
+                                guard let encodedResource = try? JSONSerialization.data(withJSONObject: resource).base64EncodedString() else {
+                                    fileLogger.error("Skipping Patient resource in \(identifier.rawValue) bundle: not JSON-serializable", category: "HealthKit")
+                                    continue
+                                }
+
                                 let patientData: [String: Any] = [
                                     "type": "PatientFHIRResource",
                                     "displayName": "FHIR Patient Data",
                                     "startDate": sample.startDate,
                                     "endDate": sample.endDate,
                                     "sourceType": identifier.rawValue,
-                                    "fhirResource": try! JSONSerialization.data(withJSONObject: resource).base64EncodedString(),
+                                    "fhirResource": encodedResource,
                                     "fhirVersion": fhirResource.fhirVersion.stringRepresentation,
                                     "fhirRelease": fhirReleaseCode(for: fhirResource.fhirVersion)
                                 ]
